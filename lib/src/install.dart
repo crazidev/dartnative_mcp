@@ -53,8 +53,9 @@ Future<int> runInstall(List<String> args) async {
     _IdeTarget('claude', 'Claude Code', '.claude', '.mcp.json', 'mcpServers'),
     _IdeTarget('gemini', 'Gemini CLI', '.gemini', p.join('.gemini', 'settings.json'), 'mcpServers'),
     _IdeTarget('opencode', 'OpenCode', '.', 'opencode.json', 'opencode'),
-    _IdeTarget('antigravity', 'Antigravity', '.antigravity', p.join('.antigravity', 'mcp.json'), 'mcpServers'),
-    _IdeTarget('chatgpt', 'ChatGPT', '.chatgpt', p.join('.chatgpt', 'mcp.json'), 'mcpServers'),
+    _IdeTarget('antigravity', 'Antigravity', '.agents', p.join('.agents', 'mcp_config.json'), 'mcpServers'),
+    _IdeTarget('codex', 'Codex', '.agents', p.join('.agents', 'mcp_config.json'), 'mcpServers'),
+    _IdeTarget('agents', 'Other agents (.agents)', '.agents', p.join('.agents', 'mcp_config.json'), 'mcpServers'),
   ];
 
   bool isDetected(_IdeTarget ide) {
@@ -109,12 +110,12 @@ Future<int> runInstall(List<String> args) async {
   }
 
   // Write launcher.
-  final launcherDir = Directory(p.join(projectDir, '.dartnative'));
+  final launcherDir = Directory(p.join(projectDir, '.dart_tool'));
   launcherDir.createSync(recursive: true);
   final isWin = Platform.isWindows;
   final launcherPath = isWin
-      ? p.join(projectDir, '.dartnative', 'mcp.bin.cmd')
-      : p.join(projectDir, '.dartnative', 'mcp.bin');
+      ? p.join(projectDir, '.dart_tool', 'mcp.bin.cmd')
+      : p.join(projectDir, '.dart_tool', 'mcp.bin');
   final dnArg = dnSdkPath != null ? ' --dn-sdk ${_sh(dnSdkPath)}' : '';
   if (isWin) {
     final pubCacheWin = Platform.environment['PUB_CACHE'];
@@ -146,7 +147,9 @@ Future<int> runInstall(List<String> args) async {
 
   // Write configs.
   final written = <String>[];
+  final writtenPaths = <String>{};
   for (final ide in ideTargets.where((i) => selectedIds.contains(i.id))) {
+    if (!writtenPaths.add(ide.configPath)) continue;
     final file = File(p.join(projectDir, ide.configPath));
     file.parent.createSync(recursive: true);
     Map<String, dynamic> json = {};
@@ -185,15 +188,16 @@ Future<int> runInstall(List<String> args) async {
 
   // Copy skills.
   final skillSource = File(p.join(packageRoot, 'skills', skillName, 'SKILL.md'));
-  final skillTargetMap = <Map<String, String>>[
-    {'target': p.join('.agents', 'skills', skillName), 'ide': 'opencode'},
-    {'target': p.join('.cursor', 'skills', skillName), 'ide': 'cursor'},
-    {'target': p.join('.claude', 'skills', skillName), 'ide': 'claude'},
+  final skillTargetMap = <Map<String, dynamic>>[
+    {'target': p.join('.agents', 'skills', skillName), 'ides': ['opencode', 'antigravity', 'codex', 'agents']},
+    {'target': p.join('.cursor', 'skills', skillName), 'ides': ['cursor']},
+    {'target': p.join('.claude', 'skills', skillName), 'ides': ['claude']},
   ];
   final copiedSkills = <String>[];
   if (skillSource.existsSync()) {
     for (final entry in skillTargetMap) {
-      if (!selectedIds.contains(entry['ide'])) continue;
+      final ides = entry['ides'] as List<String>;
+      if (!ides.any(selectedIds.contains)) continue;
       final target = entry['target']!;
       final dir = Directory(p.join(projectDir, target));
       dir.createSync(recursive: true);
@@ -206,7 +210,7 @@ Future<int> runInstall(List<String> args) async {
   stdout.writeln('');
   stdout.writeln('DartNative MCP server installed.');
   stdout.writeln('  Source: ${packageRoot}');
-  stdout.writeln('  Launcher: ${isWin ? '.dartnative\\mcp.bin.cmd' : '.dartnative/mcp.bin'}');
+  stdout.writeln('  Launcher: ${isWin ? '.dart_tool\\mcp.bin.cmd' : '.dart_tool/mcp.bin'}');
   stdout.writeln('  IDEs: ${selectedIds.join(', ')}');
   for (final f in written) stdout.writeln('  Config: $f');
   if (copiedSkills.isNotEmpty) {
