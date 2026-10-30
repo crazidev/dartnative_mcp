@@ -36,7 +36,7 @@ Experimental (`0.x`). Tool schemas may change.
 The DartNative VS Code extension installs the server for you with
 **DartNative: Install MCP Server**. It fetches the latest version from GitHub,
 activates it globally with `dart pub global activate`, and writes a
-`.dartnative/mcp.bin` launcher plus the MCP client configuration.
+`.dart_tool/dartnative_mcp` launcher plus the MCP client configuration.
 
 To do the same manually:
 
@@ -47,7 +47,7 @@ dart pub global activate --source git https://github.com/crazidev/dartnative_mcp
 Then point your MCP client at the launcher created by the extension:
 
 ```sh
-<project>/.dartnative/mcp.bin
+<project>/.dart_tool/dartnative_mcp
 ```
 
 The launcher runs the globally activated package and passes the SDK paths:
@@ -69,7 +69,7 @@ Useful flags:
 ## Client configuration
 
 All clients use the same stdio command: the project-local
-`.dartnative/mcp.bin` launcher. Replace the path with your own.
+`.dart_tool/dartnative_mcp` launcher. Replace the path with your own.
 
 ### OpenCode (`opencode.json`)
 
@@ -78,7 +78,7 @@ All clients use the same stdio command: the project-local
   "mcp": {
     "dartnative": {
       "type": "local",
-      "command": ["/path/to/project/.dartnative/mcp.bin"],
+      "command": ["/path/to/project/.dart_tool/dartnative_mcp"],
       "enabled": true
     }
   }
@@ -92,7 +92,7 @@ All clients use the same stdio command: the project-local
   "servers": {
     "dartnative": {
       "type": "stdio",
-      "command": "/path/to/project/.dartnative/mcp.bin"
+      "command": "/path/to/project/.dart_tool/dartnative_mcp"
     }
   }
 }
@@ -104,7 +104,7 @@ All clients use the same stdio command: the project-local
 {
   "mcpServers": {
     "dartnative": {
-      "command": "/path/to/project/.dartnative/mcp.bin"
+      "command": "/path/to/project/.dart_tool/dartnative_mcp"
     }
   }
 }
@@ -116,7 +116,7 @@ All clients use the same stdio command: the project-local
 {
   "mcpServers": {
     "dartnative": {
-      "command": "/path/to/project/.dartnative/mcp.bin"
+      "command": "/path/to/project/.dart_tool/dartnative_mcp"
     }
   }
 }
