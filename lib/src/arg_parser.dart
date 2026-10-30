@@ -1,0 +1,99 @@
+// Copyright (c) 2025, the Dart project authors.  Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+import 'package:args/args.dart';
+
+import 'features_configuration.dart';
+import 'utils/names.dart';
+
+/// All features that can be enabled/disabled by name or category in the MCP
+/// server.
+final allFeatureAndCategoryNames = <String>{
+  ...ToolNames.values.map((e) => e.name),
+  ...FeatureCategory.values.map((e) => e.name),
+};
+
+/// Creates an arg parser for th MCP server.
+///
+/// The `--help` option is only included if [includeHelp] is `true`.
+///
+/// Passing no options results in the default arg parser.
+ArgParser createArgParser({
+  bool includeHelp = true,
+  bool allowTrailingOptions = false,
+  int? usageLineLength,
+}) {
+  final parser =
+      ArgParser(
+          allowTrailingOptions: allowTrailingOptions,
+          usageLineLength: usageLineLength,
+        )
+        ..addOption(
+          dartSdkOption,
+          help:
+              'The path to the root of the desired Dart SDK. Defaults to the '
+              'DART_ROOT environment variable.',
+        )
+        ..addOption(
+          dnSdkOption,
+          help:
+              'The path to the root of the desired DartNative SDK (the SDK '
+              'that ships the `dn` executable). Defaults to the DN_ROOT '
+              'environment variable, then searching up from the Dart SDK.',
+        )
+        ..addFlag(
+          forceRootsFallbackFlag,
+          negatable: true,
+          defaultsTo: false,
+          help:
+              'Deprecated: tools to manage roots are always available to '
+              'improve compatibility. Use `--$disabledFeaturesOption roots` '
+              'to disable these if desired.',
+          hide: true,
+        )
+        ..addOption(
+          logFileOption,
+          help:
+              'Path to a file to log all MPC protocol traffic to. File will be '
+              'overwritten if it exists.',
+        )
+        ..addMultiOption(
+          disabledFeaturesOption,
+          aliases: ['exclude-tool'],
+          abbr: 'x',
+          help:
+              'The names or categories of features to disable. Disabled '
+              'features by name take precedence over enabled features by name '
+              'and category, and disabled features by category take precedence '
+              'over enabled features by category, but not name.',
+          allowed: allFeatureAndCategoryNames,
+        )
+        ..addMultiOption(
+          enabledFeaturesOption,
+          help:
+              'The names or categories of features to enable. Most features '
+              'are enabled by default, but some are not and must be enabled '
+              'by name or by category. See the README for which tools are '
+              'enabled by default. This can also be used to override a '
+              'disabled category to re-enable more specific features under '
+              'that category.',
+          allowed: allFeatureAndCategoryNames,
+        )
+        ..addFlag(
+          versionFlag,
+          help: 'Show the version of the MCP server and then exit',
+        );
+
+  if (includeHelp) parser.addFlag(helpFlag, abbr: 'h', help: 'Show usage text');
+  return parser;
+}
+
+const dartSdkOption = 'dart-sdk';
+const disabledFeaturesOption = 'disable';
+const dnSdkOption = 'dn-sdk';
+const enabledFeaturesOption = 'enable';
+const forceRootsFallbackFlag = 'force-roots-fallback';
+const helpFlag = 'help';
+const logFileOption = 'log-file';
+const versionFlag = 'version';

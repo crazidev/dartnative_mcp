@@ -1,0 +1,1623 @@
+// Copyright (c) 2025, the Dart project authors.  Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io' show InternetAddress;
+
+import 'package:collection/collection.dart';
+import 'package:dart_mcp/server.dart';
+import 'package:dds_service_extensions/dds_service_extensions.dart';
+import 'package:dtd/dtd.dart';
+import 'package:json_rpc_2/json_rpc_2.dart';
+import 'package:meta/meta.dart';
+import 'package:vm_service/vm_service.dart';
+import 'package:vm_service/vm_service_io.dart';
+import 'package:web_socket/web_socket.dart';
+
+import '../features_configuration.dart';
+import '../utils/analytics.dart';
+import '../utils/names.dart';
+import '../utils/process_manager.dart';
+import '../utils/sdk.dart';
+import '../utils/uuid.dart';
+
+/// Constants used by the MCP server to register services on DTD.
+///
+/// TODO(elliette): Add these to package:dtd instead.
+extension McpServiceConstants on Never {
+  /// Service name for the Dart MCP Server.
+  static const serviceName = 'DartMcpServer';
+
+  /// Service method name for the method to send a sampling request to the MCP
+  /// client.
+  static const samplingRequest = 'samplingRequest';
+}
+
+/// Mix this in to any MCPServer to add support for connecting to the Dart
+/// Tooling Daemon and all of its associated functionality (see
+/// https://pub.dev/packages/dtd).
+///
+/// The MCPServer must already have the [ToolsSupport] mixin applied.
+base mixin DartToolingDaemonSupport
+    on ToolsSupport, LoggingSupport, ResourcesSupport
+    implements AnalyticsSupport, ProcessManagerSupport, SdkSupport {
+  /// The DTD instances that this server is connected to.
+  final List<DartToolingDaemon> _dtds = [];
+
+  @visibleForTesting
+  Iterable<DartToolingDaemon> get dtds => _dtds;
+
+  /// A Map of [VmService] object [Future]s by their VM Service URI.
+  ///
+  /// [VmService] objects are automatically removed from the Map when they
+  /// are unregistered via DTD or when the VM service shuts down.
+  @visibleForTesting
+  final activeVmServices = <String, Future<VmService>>{};
+
+  /// Whether to await the disposal of all [VmService] objects in
+  /// [activeVmServices] upon server shutdown or loss of DTD connection.
+  ///
+  /// Defaults to false but can be flipped to true for testing purposes.
+  @visibleForTesting
+  static bool debugAwaitVmServiceDisposal = false;
+
+  /// A unique identifier for this server instance.
+  ///
+  /// This is generated on first access and then cached. It is used to create
+  /// a unique service name when registering services on DTD.
+  ///
+  /// Can only be accessed after `initialize` has been called.
+  String get clientId {
+    if (_clientId != null) return _clientId!;
+    final clientName = clientInfo.title ?? clientInfo.name;
+    _clientId = generateClientId(clientName);
+    return _clientId!;
+  }
+
+  String? _clientId;
+
+  @visibleForTesting
+  String generateClientId(String clientName) {
+    // Sanitizes the client name by:
+    // 1. replacing whitespace, '-', and '.' with '_'
+    // 2. removing all non-alphanumeric characters except '_'
+    final sanitizedClientName = clientName
+        .trim()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[\s\.\-]+'), '_')
+        .replaceAll(RegExp(r'[^a-zA-Z0-9_]'), '');
+    return '${sanitizedClientName}_${generateShortUUID()}';
+  }
+
+  /// Called when the DTD connection is lost or explicitly disconnected, resets
+  /// all associated state.
+  Future<void> _resetDtd(DartToolingDaemon dtd) async {
+    _dtds.remove(dtd);
+    await dtd.close();
+
+    final vmServiceUris = dtd.vmServiceUris;
+
+    final future = Future.wait(
+      vmServiceUris.map((uri) async {
+        try {
+          await (await activeVmServices.remove(uri))?.dispose();
+        } catch (_) {}
+      }),
+    );
+    debugAwaitVmServiceDisposal ? await future : unawaited(future);
+  }
+
+  /// Connects to [vmServiceUri] and adds it to the [activeVmServices].
+  Future<void> _addVmService(String vmServiceUri, {String? name}) async {
+    final vmServiceFuture = activeVmServices[vmServiceUri] =
+        vmServiceConnectUri(vmServiceUri);
+    final VmService vmService;
+    try {
+      vmService = await vmServiceFuture;
+      unawaited(
+        vmService.onDone.then((_) {
+          // If our exact instance is still in the active vm services
+          // for this uri, remove it.
+          if (activeVmServices[vmServiceUri] == vmServiceFuture) {
+            activeVmServices.remove(vmServiceUri);
+          }
+        }),
+      );
+    } catch (e) {
+      unawaited(activeVmServices.remove(vmServiceUri));
+      rethrow;
+    }
+    // Start listening for and collecting errors immediately.
+    final errorService = await _AppListener.forVmService(vmService, this);
+    final resource = Resource(
+      uri: '$runtimeErrorsScheme://${vmService.id}',
+      name: 'Errors for app ${name ?? vmServiceUri}',
+      description:
+          'Recent runtime errors seen for app "${name ?? vmServiceUri}".',
+    );
+    addResource(resource, (request) async {
+      final watch = Stopwatch()..start();
+      final result = ReadResourceResult(
+        contents: [
+          for (var error in errorService.errorLog.errors)
+            TextResourceContents(uri: resource.uri, text: error),
+        ],
+      );
+      watch.stop();
+      try {
+        analytics?.send(
+          createDartMCPEvent(
+            clientInfo: clientInfo,
+            serverInfo: implementation,
+            type: AnalyticsEvent.readResource.name,
+            additionalData: ReadResourceMetrics(
+              kind: ResourceKind.runtimeErrors,
+              length: result.contents.length,
+              elapsedMilliseconds: watch.elapsedMilliseconds,
+            ),
+          ),
+        );
+      } catch (e) {
+        log(LoggingLevel.warning, 'Error sending analytics event: $e');
+      }
+      return result;
+    });
+    try {
+      errorService.errorsStream.listen((_) => updateResource(resource));
+    } catch (_) {}
+    unawaited(
+      vmService.onDone.then((_) {
+        removeResource(resource.uri);
+      }),
+    );
+  }
+
+  /// Updates the list of active VM services based on the connected apps in DTD.
+  ///
+  /// Returns the list of all VM service URIs that are currently connected to
+  /// this DTD instance.
+  @visibleForTesting
+  Future<List<VmServiceInfo>> updateActiveVmServices(
+    DartToolingDaemon dtd,
+  ) async {
+    if (!dtd.supportsConnectedApps) return [];
+
+    final vmServiceInfos = (await dtd.getVmServices()).vmServicesInfos;
+    if (vmServiceInfos.isEmpty) return [];
+
+    for (final vmServiceInfo in vmServiceInfos) {
+      final vmServiceUri = vmServiceInfo.uri;
+      if (activeVmServices.containsKey(vmServiceUri)) {
+        continue;
+      }
+
+      try {
+        await _addVmService(vmServiceUri, name: vmServiceInfo.name);
+        dtd.vmServiceUris.add(vmServiceUri);
+      } catch (e) {
+        log(
+          LoggingLevel.warning,
+          'Failed to connect to VM service at $vmServiceUri: $e',
+        );
+      }
+    }
+    return vmServiceInfos;
+  }
+
+  @override
+  FutureOr<InitializeResult> initialize(InitializeRequest request) async {
+    registerTool(dtdTool, _dtd);
+    registerTool(getRuntimeErrorsTool, runtimeErrors);
+    registerTool(getActiveLocationTool, _getActiveLocation);
+    registerTool(hotRestartTool, hotRestart);
+    registerTool(hotReloadTool, hotReload);
+    registerTool(vmServiceTool, _vmService);
+
+    return super.initialize(request);
+  }
+
+  @visibleForTesting
+  static final List<Tool> allTools = [
+    dtdTool,
+    getRuntimeErrorsTool,
+    getActiveLocationTool,
+    hotRestartTool,
+    hotReloadTool,
+    vmServiceTool,
+  ];
+
+  @override
+  Future<void> shutdown() async {
+    await Future.wait(_dtds.toList().map(_resetDtd));
+    await super.shutdown();
+  }
+
+  Future<CallToolResult> _callVmServiceMethod(CallToolRequest request) async {
+    // These are already validated to match the schema definition.
+    var method = request.arguments?[ParameterNames.method] as String;
+    final isolateId = request.arguments?[ParameterNames.isolateId] as String?;
+    final args =
+        request.arguments?[ParameterNames.arguments] as Map<String, Object?>?;
+    final appUri = request.arguments?[ParameterNames.appUri] as String?;
+    return _callOnVmService(
+      appUri: appUri,
+      callback: (vmService) async {
+        // Services registered by other clients have to be called by their
+        // namespaced method name (e.g. `s1.foo`), so map the service name
+        // passed to `registerService` to that method.
+        final appListener = await _AppListener.forVmService(vmService, this);
+        final registrations =
+            appListener.serviceRegistrations[method] ??
+            const <String, String?>{};
+        if (registrations.length > 1) {
+          return CallToolResult(
+            isError: true,
+            content: [
+              TextContent(
+                text:
+                    'Multiple clients registered the service "$method". '
+                    'Call one of these methods instead:\n'
+                    '${_describeRegistrations(registrations)}',
+              ),
+            ],
+          )..failureReason = CallToolFailureReason.ambiguousServiceMethod;
+        }
+        if (registrations.isNotEmpty) method = registrations.keys.single;
+        try {
+          final result = await vmService.callMethod(
+            method,
+            isolateId: isolateId,
+            args: args,
+          );
+          return CallToolResult(
+            content: [TextContent(text: jsonEncode(result.json))],
+          );
+        } on RPCError catch (e) {
+          return CallToolResult(
+            isError: true,
+            content: [
+              TextContent(text: 'RPCError when invoking method $method: $e'),
+            ],
+          )..failureReason = CallToolFailureReason.rpcError;
+        } catch (e) {
+          return CallToolResult(
+            isError: true,
+            content: [TextContent(text: 'Error invoking method $method: $e')],
+          )..failureReason = CallToolFailureReason.unhandledError;
+        }
+      },
+    );
+  }
+
+  /// Lists the services registered by VM service clients, with their method
+  /// names and human readable aliases.
+  Future<CallToolResult> _listRegisteredServices(
+    CallToolRequest request,
+  ) async {
+    final appUri = request.arguments?[ParameterNames.appUri] as String?;
+    return _callOnVmService(
+      appUri: appUri,
+      callback: (vmService) async {
+        final appListener = await _AppListener.forVmService(vmService, this);
+        return CallToolResult(
+          content: [
+            TextContent(
+              text: jsonEncode([
+                for (final MapEntry(key: service, value: registrations)
+                    in appListener.serviceRegistrations.entries)
+                  for (final MapEntry(key: method, value: alias)
+                      in registrations.entries)
+                    {'service': service, 'method': method, 'alias': alias},
+              ]),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  static String _describeRegistrations(Map<String, String?> registrations) => [
+    for (final MapEntry(key: method, value: alias) in registrations.entries)
+      '- $method${alias == null || alias.isEmpty ? '' : ' ($alias)'}',
+  ].join('\n');
+
+  /// Connects to the Dart Tooling Daemon.
+  ///
+  /// Connects to a single DTD at [uri].
+  Future<CallToolResult> _connectToDtdSingle(Uri uri) async {
+    // Connecting is idempotent. This server may be shared across multiple
+    // agent sessions, so an agent may try to connect to a DTD instance that
+    // a previous session already connected to.
+    if (_dtds.firstWhereOrNull((dtd) => dtd.uri == uri) case final dtd?) {
+      final vmServiceInfos = await updateActiveVmServices(dtd);
+      return CallToolResult(
+        content: [
+          TextContent(
+            text:
+                'Already connected to $uri. '
+                '${_describeConnectedApps(vmServiceInfos)}',
+          ),
+        ],
+      );
+    }
+
+    try {
+      final dtd = await DartToolingDaemon.connect(uri);
+
+      // Verification step (check if it's VM service instead of DTD)
+      try {
+        await dtd.call(null, 'getVM');
+        // If the call above succeeds, we were connected to the vm service, and
+        // should error.
+        await dtd.close();
+        return _gotVmServiceUri;
+      } on RpcException catch (e) {
+        // Double check the failure was a method not found failure, if not
+        // rethrow it.
+        if (e.code != RpcErrorCodes.kMethodNotFound) {
+          await dtd.close();
+          rethrow;
+        }
+      }
+
+      _dtds.add(dtd);
+      dtd.uri = uri;
+      unawaited(dtd.done.then((_) async => await _resetDtd(dtd)));
+
+      await _registerServices(dtd);
+      await _listenForServices(dtd);
+
+      // Try to get the initial list of apps.
+      final vmServiceInfos = await updateActiveVmServices(dtd);
+
+      return CallToolResult(
+        content: [
+          TextContent(
+            text:
+                'Connection succeeded to $uri. '
+                '${_describeConnectedApps(vmServiceInfos)}',
+          ),
+        ],
+      );
+    } on WebSocketException catch (_) {
+      return CallToolResult(
+        isError: true,
+        content: [
+          Content.text(
+            text: 'Connection failed, make sure your DTD Uri is up to date.',
+          ),
+        ],
+      )..failureReason = CallToolFailureReason.webSocketException;
+    } catch (e) {
+      return CallToolResult(
+        isError: true,
+        content: [Content.text(text: 'Connection failed: $e')],
+      )..failureReason = CallToolFailureReason.unhandledError;
+    }
+  }
+
+  /// Describes the apps on a single DTD instance after connecting to it.
+  static String _describeConnectedApps(List<VmServiceInfo> vmServiceInfos) =>
+      vmServiceInfos.isEmpty
+      ? 'No apps currently connected. Apps started later on this DTD '
+            'instance will be connected automatically.'
+      : 'Connected apps:\n'
+            '${vmServiceInfos.map((info) => info.description).join('\n')}';
+
+  /// Connects to the Dart Tooling Daemon.
+  FutureOr<CallToolResult> _connect(CallToolRequest request) async {
+    final uriString = request.arguments?[ParameterNames.uri] as String?;
+    if (uriString == null) {
+      return CallToolResult(
+        content: [
+          Content.text(
+            text:
+                'No URI provided, list the available ones with '
+                '`${ToolNames.dtd.name}(command: '
+                '${DtdCommand.listDtdUris})`.',
+          ),
+        ],
+        isError: true,
+      )..failureReason = CallToolFailureReason.mustSpecifyDtdUri;
+    }
+
+    // The `uri` argument originates from the LLM and is therefore
+    // attacker-influenced (prompt injection). DTD instances always run on the
+    // local machine, so restrict connections to loopback hosts to prevent this
+    // tool from being used to open outbound WebSocket connections to arbitrary
+    // remote endpoints.
+    final uri = Uri.tryParse(uriString);
+    if (uri == null) {
+      return CallToolResult(
+        isError: true,
+        content: [Content.text(text: 'Failed to parse uri $uriString')],
+      )..failureReason = CallToolFailureReason.argumentError;
+    }
+    if (_checkIsAllowedDtdUri(uri) case final error?) {
+      return error;
+    }
+
+    return _connectToDtdSingle(uri);
+  }
+
+  /// Checks whether [uri] is an acceptable target for [_connect].
+  ///
+  /// Only `ws`/`wss` URIs targeting the local machine are allowed; the Dart
+  /// Tooling Daemon always listens on a loopback interface.
+  ///
+  /// If [uri] is invalid, returns an error result.
+  static CallToolResult? _checkIsAllowedDtdUri(Uri uri) {
+    if (uri.scheme != 'ws' && uri.scheme != 'wss') {
+      return _invalidDtdUri;
+    }
+    final host = uri.host;
+    if (host.isEmpty) return _invalidDtdUri;
+    if (host == 'localhost') return null;
+
+    final ip = InternetAddress.tryParse(host);
+    if (ip == null || !ip.isLoopback) return _invalidDtdUri;
+    return null;
+  }
+
+  /// Lists the available Dart Tooling Daemon instances.
+  Future<CallToolResult> _listDtdInstancesTool(CallToolRequest request) async {
+    final (:output, :error) = await _listDtdInstances();
+    if (error != null) {
+      return CallToolResult(isError: true, content: [Content.text(text: error)])
+        ..failureReason = CallToolFailureReason.nonZeroExitCode;
+    }
+    return CallToolResult(
+      content: [
+        Content.text(text: output!),
+        if (_dtds.isNotEmpty)
+          Content.text(
+            text:
+                'Already connected to: '
+                '${_dtds.map((dtd) => dtd.uri).join(', ')}. Use '
+                '"${DtdCommand.listConnectedApps}" to see their apps.',
+          ),
+      ],
+    );
+  }
+
+  /// Runs `dart tooling-daemon --list` and returns either its `output` or an
+  /// `error` message.
+  Future<({String? output, String? error})> _listDtdInstances() async {
+    final result = await processManager.run([
+      sdk.dartExecutablePath,
+      'tooling-daemon',
+      '--list',
+    ]);
+    if (result.exitCode != 0) {
+      log(
+        LoggingLevel.warning,
+        'dart tooling-daemon --list failed: ${result.stderr}',
+      );
+      return (
+        output: null,
+        error: 'dart tooling-daemon --list failed: ${result.stderr}',
+      );
+    }
+    return (output: result.stdout as String, error: null);
+  }
+
+  /// The [dtdTool] for managing DTD connections.
+  static final dtdTool = Tool(
+    name: ToolNames.dtd.name,
+    description:
+        'Manage live app connections to running Dart and DartNative apps using '
+        'the Dart Tooling Daemon (DTD). A DTD connection is REQUIRED before '
+        'listing apps or using any tool that interacts with a running app '
+        '(hot reload/restart, runtime errors, widget inspector, vm service, '
+        'etc). Workflow:\n'
+        '1. `${DtdCommand.listDtdUris}`: find available DTD instances and '
+        'their URIs. If you see DTD instances with a working dir that looks '
+        'like a home directory, these are likely connected to an IDE and you '
+        'should connect to those to find IDE launched apps.\n'
+        '2. `${DtdCommand.connect}` with the chosen `${ParameterNames.uri}`. '
+        'All apps registered with that DTD instance are connected to '
+        'automatically.\n'
+        '3. `${DtdCommand.listConnectedApps}` (optional): list the apps on '
+        'all connected DTD instances. This only returns apps after step 2.\n'
+        'Use `${DtdCommand.disconnect}` to disconnect from a DTD instance.',
+    inputSchema: Schema.object(
+      properties: {
+        ParameterNames.command: EnumSchema.untitledSingleSelect(
+          description:
+              'The command to execute. Call "${DtdCommand.listDtdUris}" and '
+              'then "${DtdCommand.connect}" before '
+              '"${DtdCommand.listConnectedApps}".',
+          values: [
+            DtdCommand.listDtdUris,
+            DtdCommand.connect,
+            DtdCommand.listConnectedApps,
+            DtdCommand.disconnect,
+          ],
+        ),
+        ParameterNames.uri: Schema.string(
+          description:
+              'The DTD URI to connect to or disconnect from. '
+              'Required for "${DtdCommand.connect}", optional for '
+              '"${DtdCommand.disconnect}" (if only one DTD is connected).',
+        ),
+      },
+      required: [ParameterNames.command],
+      additionalProperties: false,
+    ),
+    annotations: ToolAnnotations(title: 'Dart Tooling Daemon'),
+  )..categories = [FeatureCategory.dartToolingDaemon];
+
+  Future<CallToolResult> _dtd(CallToolRequest request) async {
+    final command = request.arguments![ParameterNames.command] as String;
+    switch (command) {
+      case DtdCommand.connect:
+        return _connect(request);
+      case DtdCommand.disconnect:
+        return _disconnect(request);
+      case DtdCommand.listConnectedApps:
+        return _listConnectedApps(request);
+      case DtdCommand.listDtdUris:
+        return _listDtdInstancesTool(request);
+      default:
+        return CallToolResult(
+          isError: true,
+          content: [TextContent(text: 'Unknown command: $command')],
+        )..failureReason = CallToolFailureReason.noSuchCommand;
+    }
+  }
+
+  Future<CallToolResult> _listConnectedApps(CallToolRequest request) async {
+    // Only error if there is no way we could possibly find any apps. If we are
+    // connected to a DTD instance, we always refresh the list of apps from it
+    // below, and an empty list is a valid (non-error) result.
+    if (_dtds.isEmpty && activeVmServices.isEmpty) {
+      return _noActiveAppConnection();
+    }
+    final textResult = <TextContent>[];
+    // Connected app info by DTD uri.
+    final structuredResult = <String, List<Map<String, Object?>>>{};
+
+    final loggedAppUris = <String>{};
+    for (final dtd in _dtds) {
+      final vmServiceInfos = await updateActiveVmServices(dtd);
+      final appsDescription = vmServiceInfos.isEmpty
+          ? 'No connected apps found.\n'
+          : 'Connected apps:\n'
+                '${vmServiceInfos.map((a) => a.description).join('\n')}\n\n';
+      textResult.add(
+        TextContent(text: '## DTD at `${dtd.uri}`\n$appsDescription'),
+      );
+      structuredResult[dtd.uri.toString()] = vmServiceInfos
+          .map((a) => a.toJson())
+          .toList();
+      for (var info in vmServiceInfos) {
+        loggedAppUris.add(info.uri);
+      }
+    }
+
+    // Include other apps as well that are not associated with a DTD instance.
+    final standaloneApps = activeVmServices.keys.where(
+      (uri) => !loggedAppUris.contains(uri),
+    );
+    if (standaloneApps.isNotEmpty) {
+      structuredResult['standalone'] = [
+        for (final uri in standaloneApps) VmServiceInfo(uri: uri).toJson(),
+      ];
+      textResult.add(
+        TextContent(
+          text: '## Standalone Apps:\n${standaloneApps.join('\n')}\n',
+        ),
+      );
+    }
+
+    if (structuredResult.values.every((apps) => apps.isEmpty)) {
+      textResult.add(TextContent(text: _noAppsOnConnectedDtdsGuidance));
+    }
+
+    return CallToolResult(
+      content: textResult,
+      structuredContent: structuredResult,
+    );
+  }
+
+  /// Guidance for the agent when it is connected to one or more DTD instances,
+  /// but none of them have any running apps.
+  static final _noAppsOnConnectedDtdsGuidance =
+      'No running apps were found on the connected DTD instance(s). The app '
+      'may not be running yet (ask the user to start it in debug mode, or '
+      'launch it yourself if a launch tool is available), or it may be '
+      'registered with a different DTD instance (for example one belonging '
+      'to a different IDE window). Use `${ToolNames.dtd.name}` with command '
+      '"${DtdCommand.listDtdUris}" to find other DTD instances and '
+      '"${DtdCommand.connect}" to connect to the right one.';
+
+  /// Builds an error result for when a tool requires a connected app but none
+  /// is available.
+  ///
+  /// The result contains concrete next steps based on the current connection
+  /// state. When no DTD is connected at all, the list of available DTD
+  /// instances is included directly so that the agent can immediately call
+  /// the `connect` command without an extra round trip.
+  Future<CallToolResult> _noActiveAppConnection() async {
+    if (_dtds.isNotEmpty) {
+      if (!_dtds.any((dtd) => dtd.supportsConnectedApps)) {
+        return _connectedAppsNotSupported;
+      }
+      return CallToolResult(
+        isError: true,
+        content: [
+          TextContent(
+            text:
+                'Connected to DTD at '
+                '${_dtds.map((dtd) => '`${dtd.uri}`').join(', ')}, but there '
+                'is no active app connection. $_noAppsOnConnectedDtdsGuidance',
+          ),
+        ],
+      )..failureReason = CallToolFailureReason.noActiveDebugSession;
+    }
+
+    final dtdList = await _listDtdInstances();
+    final dtdListText = switch (dtdList) {
+      (output: final output?, error: null) when output.trim().isNotEmpty =>
+        'Output of `${ToolNames.dtd.name}` command '
+            '"${DtdCommand.listDtdUris}":\n$output',
+      (output: _, error: null) =>
+        'No DTD instances were found. Ask the user to start their app or IDE, '
+            'then use `${ToolNames.dtd.name}` with command '
+            '"${DtdCommand.listDtdUris}" to try again.',
+      (output: _, error: final error) =>
+        'Failed to list DTD instances ($error). Use `${ToolNames.dtd.name}` '
+            'with command "${DtdCommand.listDtdUris}" to try again.',
+    };
+    return CallToolResult(
+      isError: true,
+      content: [
+        TextContent(
+          text:
+              'Not connected to the Dart Tooling Daemon (DTD), so no apps are '
+              'available. Connecting is a required first step before using '
+              'any tool that interacts with a running app. AGENT: Be '
+              'pro-active and do this yourself unless explicitly instructed '
+              'otherwise:\n'
+              '1. Pick a DTD "WS URI" from the list below. Prefer an instance '
+              'whose workspace root matches the project you are working on. '
+              'Instances whose working directory looks like a home directory '
+              'usually belong to an IDE and will have IDE-launched apps.\n'
+              '2. Call `${ToolNames.dtd.name}` with '
+              '`{"${ParameterNames.command}": "${DtdCommand.connect}", '
+              '"${ParameterNames.uri}": "<WS URI>"}`.\n'
+              '3. Retry the original tool call.\n\n'
+              '$dtdListText',
+        ),
+      ],
+    )..failureReason = CallToolFailureReason.dtdNotConnected;
+  }
+
+  Future<CallToolResult> _disconnect(CallToolRequest request) async {
+    var uriString = request.arguments?[ParameterNames.uri] as String?;
+    if (uriString == null) {
+      if (_dtds.isEmpty) {
+        return CallToolResult(
+          content: [TextContent(text: 'No active DTD connections.')],
+        );
+      }
+      if (_dtds.length > 1) {
+        return CallToolResult(
+          isError: true,
+          content: [
+            TextContent(
+              text:
+                  'Multiple DTD connections active. You must specify which one '
+                  'to disconnect.',
+            ),
+          ],
+        )..failureReason = CallToolFailureReason.mustSpecifyDtdUri;
+      }
+      uriString = _dtds.first.uri.toString();
+    }
+
+    final uri = Uri.parse(uriString);
+    final dtd = _dtds.firstWhereOrNull((dtd) => dtd.uri == uri);
+    if (dtd == null) {
+      return CallToolResult(
+        isError: true,
+        content: [TextContent(text: 'Not connected to DTD at $uri')],
+      )..failureReason = CallToolFailureReason.alreadyDisconnected;
+    }
+    await _resetDtd(dtd);
+    return CallToolResult(content: [TextContent(text: 'Disconnected.')]);
+  }
+
+  /// Registers all MCP server-provided services on the connected DTD instance.
+  Future<void> _registerServices(DartToolingDaemon dtd) async {
+    if (clientCapabilities.sampling != null) {
+      await dtd.registerService(
+        '${McpServiceConstants.serviceName}_$clientId',
+        McpServiceConstants.samplingRequest,
+        _handleSamplingRequest,
+      );
+    }
+  }
+
+  Future<Map<String, Object?>> _handleSamplingRequest(Parameters params) async {
+    final result = await createMessage(
+      CreateMessageRequest.fromMap(params.asMap.cast<String, Object?>()),
+    );
+
+    return {
+      'type': 'Success', // Type is required by DTD.
+      ...result.toJson(),
+    };
+  }
+
+  /// Listens to the `ConnectedApp` and `Editor` streams to get app and IDE
+  /// state information.
+  ///
+  /// The dart tooling daemon must be connected prior to calling this function.
+  Future<void> _listenForServices(DartToolingDaemon dtd) async {
+    dtd.supportsConnectedApps = false;
+    try {
+      final registeredServices = await dtd.getRegisteredServices();
+      if (registeredServices.dtdServices.contains(
+        '${ConnectedAppServiceConstants.serviceName}.'
+        '${ConnectedAppServiceConstants.getVmServices}',
+      )) {
+        dtd.supportsConnectedApps = true;
+      }
+    } catch (_) {}
+
+    if (dtd.supportsConnectedApps) {
+      await _listenForConnectedAppServiceEvents(dtd);
+    }
+    await _listenForEditorEvents(dtd);
+  }
+
+  Future<void> _listenForConnectedAppServiceEvents(
+    DartToolingDaemon dtd,
+  ) async {
+    dtd.onVmServiceUpdate().listen((e) async {
+      log(LoggingLevel.debug, e.toString());
+      switch (e.kind) {
+        case ConnectedAppServiceConstants.vmServiceRegistered:
+          await updateActiveVmServices(dtd);
+        case ConnectedAppServiceConstants.vmServiceUnregistered:
+          // We can remove it regardless of which DTD it came from since the URI
+          //is unique
+          await activeVmServices
+              .remove(e.data['uri'] as String)
+              ?.then((service) => service.dispose());
+        default:
+      }
+    });
+    await dtd.streamListen(ConnectedAppServiceConstants.serviceName);
+  }
+
+  /// Listens for editor specific events.
+  Future<void> _listenForEditorEvents(DartToolingDaemon dtd) async {
+    dtd.onEvent('Editor').listen((e) async {
+      log(LoggingLevel.debug, e.toString());
+      switch (e.kind) {
+        case 'activeLocationChanged':
+          dtd.activeLocation = e.data;
+        default:
+      }
+    });
+    await dtd.streamListen('Editor');
+  }
+
+  /// Performs a hot restart on the currently running app.
+  ///
+  /// If more than one debug session is active, then it just uses the first
+  /// one.
+  // TODO: support passing a debug session id when there is more than one
+  // debug session.
+  Future<CallToolResult> hotRestart(CallToolRequest request) async {
+    final appUri = request.arguments?[ParameterNames.appUri] as String?;
+    return _callOnVmService(
+      appUri: appUri,
+      callback: (vmService) async {
+        final appListener = await _AppListener.forVmService(vmService, this);
+        appListener.errorLog.clear();
+
+        final vm = await vmService.getVM();
+        var success = false;
+        try {
+          final hotRestartMethodName =
+              (await appListener.waitForServiceRegistration('hotRestart')) ??
+              'hotRestart';
+
+          /// If we haven't seen a specific one, we just call the default one.
+          final result = await vmService.callMethod(
+            hotRestartMethodName,
+            isolateId: vm.isolates!.first.id,
+          );
+          final resultType = result.json?['type'];
+          success = resultType == 'Success';
+        } catch (e) {
+          // Handle potential errors during the process
+          return CallToolResult(
+            isError: true,
+            content: [TextContent(text: 'Hot restart failed: $e')],
+          )..failureReason = CallToolFailureReason.unhandledError;
+        }
+        return CallToolResult(
+          isError: !success ? true : null,
+          content: [
+            TextContent(
+              text: 'Hot restart ${success ? 'succeeded' : 'failed'}.',
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// Performs a hot reload on the currently running app.
+  ///
+  /// If more than one debug session is active, then it just uses the first one.
+  ///
+  // TODO: support passing a debug session id when there is more than one debug
+  // session.
+  Future<CallToolResult> hotReload(CallToolRequest request) async {
+    final appUri = request.arguments?[ParameterNames.appUri] as String?;
+    return _callOnVmService(
+      appUri: appUri,
+      callback: (vmService) async {
+        final appListener = await _AppListener.forVmService(vmService, this);
+        if (request.arguments?['clearRuntimeErrors'] == true) {
+          appListener.errorLog.clear();
+        }
+
+        final vm = await vmService.getVM();
+        ReloadReport? report;
+
+        try {
+          final hotReloadMethodName = await appListener
+              .waitForServiceRegistration('reloadSources');
+
+          /// If we haven't seen a specific one, we just call the default one.
+          if (hotReloadMethodName == null) {
+            report = await vmService.reloadSources(vm.isolates!.first.id!);
+          } else {
+            final result = await vmService.callMethod(
+              hotReloadMethodName,
+              isolateId: vm.isolates!.first.id,
+            );
+            final resultType = result.json?['type'];
+            if (resultType == 'Success' ||
+                (resultType == 'ReloadReport' &&
+                    result.json?['success'] == true)) {
+              report = ReloadReport(success: true);
+            } else {
+              report = ReloadReport(success: false);
+            }
+          }
+        } catch (e) {
+          // Handle potential errors during the process
+          return CallToolResult(
+            isError: true,
+            content: [TextContent(text: 'Hot reload failed: $e')],
+          )..failureReason = CallToolFailureReason.unhandledError;
+        }
+        final success = report.success == true;
+        return CallToolResult(
+            isError: !success ? true : null,
+            content: [
+              TextContent(
+                text: 'Hot reload ${success ? 'succeeded' : 'failed'}.',
+              ),
+            ],
+          )
+          ..failureReason = !success
+              ? CallToolFailureReason.wrappedServiceIssue
+              : null;
+      },
+    );
+  }
+
+  /// Retrieves runtime errors from the currently running app.
+  ///
+  /// If more than one debug session is active, then it just uses the first one.
+  ///
+  // TODO: support passing a debug session id when there is more than one debug
+  // session.
+  Future<CallToolResult> runtimeErrors(CallToolRequest request) async {
+    final appUri = request.arguments?[ParameterNames.appUri] as String?;
+    return _callOnVmService(
+      appUri: appUri,
+      callback: (vmService) async {
+        try {
+          final errorService = await _AppListener.forVmService(vmService, this);
+          final errorLog = errorService.errorLog;
+
+          if (errorLog.errors.isEmpty) {
+            return CallToolResult(
+              content: [TextContent(text: 'No runtime errors found.')],
+            );
+          }
+          final result = CallToolResult(
+            content: [
+              TextContent(
+                text:
+                    'Found ${errorLog.errors.length} '
+                    'error${errorLog.errors.length == 1 ? '' : 's'}:\n',
+              ),
+              for (final e in errorLog.errors) TextContent(text: e.toString()),
+            ],
+          );
+          if (request.arguments?['clearRuntimeErrors'] == true) {
+            errorService.errorLog.clear();
+          }
+          return result;
+        } catch (e) {
+          return CallToolResult(
+            isError: true,
+            content: [TextContent(text: 'Failed to get runtime errors: $e')],
+          )..failureReason = CallToolFailureReason.unhandledError;
+        }
+      },
+    );
+  }
+
+  /// Calls [callback] on the first active debug session, if available.
+  Future<CallToolResult> _callOnVmService({
+    required Future<CallToolResult> Function(VmService) callback,
+    String? appUri,
+  }) async {
+    // Update active vm services for all connected DTDs, if we have no active
+    // ones or if the requested appUri is not in the active vm services.
+    if (activeVmServices.isEmpty ||
+        (appUri != null && !activeVmServices.containsKey(appUri))) {
+      for (final dtd in _dtds) {
+        if (dtd.supportsConnectedApps) {
+          await updateActiveVmServices(dtd);
+        }
+      }
+    }
+
+    if (activeVmServices.isEmpty) return _noActiveAppConnection();
+
+    final String selectedAppUri;
+    if (appUri != null) {
+      if (!activeVmServices.containsKey(appUri)) {
+        return CallToolResult(
+          isError: true,
+          content: [
+            TextContent(
+              text:
+                  'App with URI "$appUri" not found. Use "${dtdTool.name}" '
+                  'with command "${DtdCommand.listConnectedApps}" to see '
+                  'available apps.',
+            ),
+          ],
+        )..failureReason = CallToolFailureReason.applicationNotFound;
+      }
+      selectedAppUri = appUri;
+    } else {
+      if (activeVmServices.length > 1) {
+        return CallToolResult(
+          isError: true,
+          content: [
+            TextContent(
+              text:
+                  'Multiple apps connected. You must provide an '
+                  '"${ParameterNames.appUri}". Use "${dtdTool.name}" with '
+                  'command "${DtdCommand.listConnectedApps}" to see available '
+                  'apps.',
+            ),
+          ],
+        )..failureReason = CallToolFailureReason.mustSpecifyDtdUri;
+      }
+      selectedAppUri = activeVmServices.keys.first;
+    }
+
+    final vmService = await activeVmServices[selectedAppUri]!;
+    return await Future.any([
+      callback(vmService),
+      vmService.onDone.then<CallToolResult>((_) {
+        return CallToolResult(
+          isError: true,
+          content: [TextContent(text: 'Service connection disposed.')],
+        )..failureReason = CallToolFailureReason.alreadyDisconnected;
+      }),
+    ]);
+  }
+
+  /// Retrieves the active location from the editor.
+  Future<CallToolResult> _getActiveLocation(CallToolRequest request) async {
+    if (_dtds.isEmpty) return _dtdNotConnected;
+
+    Map<String, Object?>? activeLocation;
+    for (final dtd in _dtds) {
+      activeLocation = dtd.activeLocation;
+      if (activeLocation != null) break;
+    }
+
+    if (activeLocation == null) {
+      return CallToolResult(
+        content: [TextContent(text: 'No active location found.')],
+      );
+    }
+    return CallToolResult(
+      content: [TextContent(text: jsonEncode(activeLocation))],
+      structuredContent: activeLocation,
+    );
+  }
+
+  @visibleForTesting
+  static final getRuntimeErrorsTool = Tool(
+    name: ToolNames.getRuntimeErrors.name,
+    description:
+        'Retrieves the most recent runtime errors that have occurred in the '
+        'active Dart or DartNative application. '
+        'Requires an active DTD connection.',
+    annotations: ToolAnnotations(
+      title: 'Get runtime errors',
+      readOnlyHint: true,
+    ),
+    inputSchema: Schema.object(
+      properties: {
+        'clearRuntimeErrors': Schema.bool(
+          title: 'Whether to clear the runtime errors after retrieving them.',
+          description:
+              'This is useful to clear out old errors that may no longer be '
+              'relevant before reading them again.',
+        ),
+        ParameterNames.appUri: Schema.string(
+          description:
+              'The app URI to get runtime errors from. Required if '
+              'multiple apps are connected.',
+        ),
+      },
+      additionalProperties: false,
+    ),
+  )..categories = [FeatureCategory.dartToolingDaemon];
+
+  static final hotReloadTool = Tool(
+    name: ToolNames.hotReload.name,
+    description:
+        'Performs a hot reload of the active DartNative application. '
+        'Requires an active DTD connection, use '
+        'the `${DartToolingDaemonSupport.dtdTool.name}` tool to discover and '
+        'connect to an app pro-actively (don\'t wait for the user to instruct '
+        'you, this is a safe operation with minimal bad consequences).',
+    annotations: ToolAnnotations(title: 'Hot reload', destructiveHint: true),
+    inputSchema: Schema.object(
+      properties: {
+        'clearRuntimeErrors': Schema.bool(
+          title: 'Whether to clear runtime errors before hot reloading.',
+          description:
+              'This is useful to clear out old errors that may no longer be '
+              'relevant.',
+        ),
+        ParameterNames.appUri: Schema.string(
+          description:
+              'The app URI to perform the hot reload on. Required if '
+              'multiple apps are connected. This may also be referred to as '
+              'a VM Service URI.',
+        ),
+      },
+      additionalProperties: false,
+    ),
+  )..categories = [FeatureCategory.dartToolingDaemon];
+
+  static final hotRestartTool = Tool(
+    name: ToolNames.hotRestart.name,
+    description:
+        'Performs a hot restart of the active DartNative application. '
+        'This applies the latest code changes to the running application, '
+        'including changes to global const values, while resetting '
+        'application state. Requires an active DTD connection. Doesn\'t work '
+        'for plain Dart CLI programs.',
+    annotations: ToolAnnotations(title: 'Hot restart', destructiveHint: true),
+    inputSchema: Schema.object(
+      properties: {
+        ParameterNames.appUri: Schema.string(
+          description:
+              'The app URI to perform the hot restart on. Required if multiple '
+              'apps are connected. This may also be referred to as a VM '
+              'Service URI.',
+        ),
+      },
+      additionalProperties: false,
+    ),
+  )..categories = [FeatureCategory.dartToolingDaemon];
+
+  @visibleForTesting
+  static final getActiveLocationTool =
+      Tool(
+          name: ToolNames.getActiveLocation.name,
+          description:
+              'Retrieves the current active location (e.g., cursor position) '
+              'in the connected editor. Requires an active DTD connection.',
+          annotations: ToolAnnotations(
+            title: 'Get Active Editor Location',
+            readOnlyHint: true,
+          ),
+          inputSchema: Schema.object(additionalProperties: false),
+        )
+        ..categories = [FeatureCategory.dartToolingDaemon]
+        ..enabledByDefault = false;
+
+  @visibleForTesting
+  static final vmServiceTool = Tool(
+    name: ToolNames.vmService.name,
+    description:
+        'Manage and interact with VM service connections. This tool '
+        'allows you to connect to an app using its VM service URI, disconnect '
+        'from it, invoke VM service methods directly, or list the services '
+        'that VM service clients registered on it. '
+        'Connecting allows features like hot reload to work on apps not '
+        'launched via DTD.',
+    annotations: ToolAnnotations(title: 'VM Service'),
+    inputSchema: Schema.object(
+      properties: {
+        ParameterNames.command: EnumSchema.untitledSingleSelect(
+          description: 'The command to execute.',
+          values: [
+            VmServiceCommand.connect,
+            VmServiceCommand.disconnect,
+            VmServiceCommand.callMethod,
+            VmServiceCommand.listRegisteredServices,
+          ],
+        ),
+        ParameterNames.appUri: Schema.string(
+          description:
+              'The app URI (vm service URI) to target. Required if multiple '
+              'apps are connected, or when connecting or disconnecting.',
+        ),
+        ParameterNames.method: Schema.string(
+          description:
+              'The name of the vm service method to invoke. Required for '
+              '${VmServiceCommand.callMethod}. Services registered by other '
+              'VM service clients can be called by the name they were '
+              'registered with; use the '
+              '${VmServiceCommand.listRegisteredServices} command to list '
+              'them.',
+        ),
+        ParameterNames.isolateId: Schema.string(
+          description:
+              'The isolate ID to target, you can find isolate IDs using the '
+              '`getVM` method. Only methods that require an isolate ID should '
+              'be given one.',
+        ),
+        ParameterNames.arguments: Schema.object(
+          description: 'Arguments for the method (optional).',
+          additionalProperties: true,
+        ),
+      },
+      required: [ParameterNames.command],
+      additionalProperties: false,
+    ),
+  )..categories = [FeatureCategory.dartToolingDaemon];
+
+  Future<CallToolResult> _vmService(CallToolRequest request) async {
+    final command = request.arguments![ParameterNames.command] as String;
+    final uriString = request.arguments?[ParameterNames.appUri] as String?;
+    switch (command) {
+      case VmServiceCommand.connect:
+        if (uriString == null) {
+          return CallToolResult(
+            isError: true,
+            content: [
+              TextContent(text: 'No URI provided for connect command.'),
+            ],
+          )..failureReason = CallToolFailureReason.argumentError;
+        }
+        if (activeVmServices.containsKey(uriString)) {
+          return CallToolResult(
+            content: [TextContent(text: 'Already connected to $uriString.')],
+          );
+        }
+        try {
+          await _addVmService(uriString);
+          return CallToolResult(
+            content: [
+              TextContent(text: 'Successfully connected to $uriString.'),
+            ],
+          );
+        } catch (e) {
+          return CallToolResult(
+            isError: true,
+            content: [TextContent(text: 'Failed to connect: $e')],
+          )..failureReason = CallToolFailureReason.unhandledError;
+        }
+
+      case VmServiceCommand.disconnect:
+        if (uriString == null) {
+          return CallToolResult(
+            isError: true,
+            content: [
+              TextContent(text: 'No URI provided for connect command.'),
+            ],
+          )..failureReason = CallToolFailureReason.argumentError;
+        }
+        final vmServiceFuture = activeVmServices.remove(uriString);
+        if (vmServiceFuture == null) {
+          return CallToolResult(
+            isError: true,
+            content: [TextContent(text: 'Not connected to $uriString.')],
+          )..failureReason = CallToolFailureReason.applicationNotFound;
+        }
+        try {
+          final vmService = await vmServiceFuture;
+          await vmService.dispose();
+          return CallToolResult(
+            content: [TextContent(text: 'Disconnected from $uriString.')],
+          );
+        } catch (e) {
+          return CallToolResult(
+            isError: true,
+            content: [TextContent(text: 'Error disconnecting: $e')],
+          )..failureReason = CallToolFailureReason.unhandledError;
+        }
+
+      case VmServiceCommand.callMethod:
+        final method = request.arguments?[ParameterNames.method] as String?;
+        if (method == null) {
+          return CallToolResult(
+            isError: true,
+            content: [TextContent(text: 'No method provided for callMethod.')],
+          )..failureReason = CallToolFailureReason.argumentError;
+        }
+        return _callVmServiceMethod(request);
+
+      case VmServiceCommand.listRegisteredServices:
+        return _listRegisteredServices(request);
+
+      default:
+        return CallToolResult(
+          isError: true,
+          content: [TextContent(text: 'Unknown command: $command')],
+        )..failureReason = CallToolFailureReason.noSuchCommand;
+    }
+  }
+
+  static final _connectedAppsNotSupported = CallToolResult(
+    isError: true,
+    content: [
+      TextContent(
+        text:
+            'A Dart SDK of version 3.9.0-163.0.dev or greater is required to '
+            'connect to Dart and DartNative applications.',
+      ),
+    ],
+  )..failureReason = CallToolFailureReason.connectedAppServiceNotSupported;
+
+  static final _dtdNotConnected = CallToolResult(
+    isError: true,
+    content: [
+      TextContent(
+        text:
+            'The dart tooling daemon is not connected, you need to call '
+            '"${dtdTool.name}" with command "${DtdCommand.connect}" first.',
+      ),
+    ],
+  )..failureReason = CallToolFailureReason.dtdNotConnected;
+
+  static final _gotVmServiceUri = CallToolResult(
+    content: [
+      Content.text(
+        text:
+            'Connected to a VM Service but expected to connect to a Dart '
+            'Tooling Daemon service. Use the '
+            '${vmServiceTool.name}.${VmServiceCommand.connect} tool instead.',
+      ),
+    ],
+    isError: true,
+  )..failureReason = CallToolFailureReason.givenVmServiceUri;
+
+  static final _invalidDtdUri = CallToolResult(
+    isError: true,
+    content: [
+      Content.text(
+        text:
+            'Refusing to connect to invalid DTD URI. URIs must use the '
+            'ws:// or wss:// scheme and a loopback host (127.0.0.1, ::1, '
+            'or localhost).',
+      ),
+    ],
+  )..failureReason = CallToolFailureReason.argumentError;
+
+  static final runtimeErrorsScheme = 'runtime-errors';
+}
+
+/// Listens on a VM service for relevant events, such as errors and registered
+/// vm service methods.
+class _AppListener {
+  /// All the errors recorded so far (may be cleared explicitly).
+  final ErrorLog errorLog;
+
+  /// A broadcast stream of all errors that come in after you start listening.
+  Stream<String> get errorsStream => _errorsController.stream;
+
+  /// A map of service names to the names of their methods.
+  final Map<String, String?> registeredServices;
+
+  /// All services registered by VM service clients, keyed by the service name
+  /// passed to `registerService`, then by the method name to call (which is
+  /// namespaced by the registering client, e.g. `s1.myService`), with the
+  /// human readable alias as the value.
+  ///
+  /// More than one client can register the same service name.
+  final Map<String, Map<String, String?>> serviceRegistrations;
+
+  /// A map of service names to completers that should be fired when the service
+  /// is registered.
+  final _pendingServiceRequests = <String, List<Completer<String?>>>{};
+
+  /// Controller for the [errorsStream].
+  final StreamController<String> _errorsController;
+
+  /// Stream subscriptions we need to cancel on [shutdown].
+  final Iterable<StreamSubscription<void>> _subscriptions;
+
+  /// The vm service instance connected to the app.
+  final VmService _vmService;
+
+  _AppListener._(
+    this.errorLog,
+    this.registeredServices,
+    this.serviceRegistrations,
+    this._errorsController,
+    this._subscriptions,
+    this._vmService,
+  ) {
+    _vmService.onDone.then((_) => shutdown());
+  }
+
+  /// Maintain a cache of app listeners by [VmService] instance as an
+  /// [Expando] so we don't have to worry about explicit cleanup.
+  static final _appListeners = Expando<Future<_AppListener>>();
+
+  /// Returns the canonical [_AppListener] for the [vmService] instance,
+  /// which may be an already existing instance.
+  static Future<_AppListener> forVmService(
+    VmService vmService,
+    LoggingSupport logger,
+  ) async {
+    return _appListeners[vmService] ??= () async {
+      // Needs to be a broadcast stream because we use it to add errors to the
+      // list but also expose it to clients so they can know when new errors
+      // are added.
+      final errorsController = StreamController<String>.broadcast();
+      final errorLog = ErrorLog();
+      errorsController.stream.listen(errorLog.add);
+      final subscriptions = <StreamSubscription<void>>[];
+      final registeredServices = <String, String?>{};
+      final serviceRegistrations = <String, Map<String, String?>>{};
+      final pendingServiceRequests = <String, List<Completer<String?>>>{};
+
+      try {
+        subscriptions.addAll([
+          vmService.onServiceEvent.listen((Event e) {
+            switch (e.kind) {
+              case EventKind.kServiceRegistered:
+                final serviceName = e.service!;
+                registeredServices[serviceName] = e.method;
+                serviceRegistrations.putIfAbsent(
+                  serviceName,
+                  () => {},
+                )[e.method!] = e.alias;
+                // If there are any pending requests for this service, complete
+                // them.
+                if (pendingServiceRequests.containsKey(serviceName)) {
+                  for (final completer
+                      in pendingServiceRequests[serviceName]!) {
+                    completer.complete(e.method);
+                  }
+                  pendingServiceRequests.remove(serviceName);
+                }
+              case EventKind.kServiceUnregistered:
+                final serviceName = e.service!;
+                final remaining = serviceRegistrations[serviceName]
+                  ?..remove(e.method);
+                if (remaining == null || remaining.isEmpty) {
+                  serviceRegistrations.remove(serviceName);
+                  registeredServices.remove(serviceName);
+                } else if (registeredServices[serviceName] == e.method) {
+                  // Other clients still provide this service, so keep it
+                  // available but point it at a remaining registration.
+                  registeredServices[serviceName] = remaining.keys.last;
+                }
+            }
+          }),
+          vmService.onIsolateEvent.listen((e) {
+            switch (e.kind) {
+              case EventKind.kServiceExtensionAdded:
+                registeredServices[e.extensionRPC!] = null;
+            }
+          }),
+        ]);
+        subscriptions.add(
+          vmService.onExtensionEventWithHistory.listen((Event e) {
+            if (e.extensionKind == 'Flutter.Error') {
+              // TODO(https://github.com/dart-lang/ai/issues/57): consider
+              // pruning this content down to only what is useful for the LLM to
+              // understand the error and its source.
+              errorsController.add(e.json.toString());
+            }
+          }),
+        );
+        Event? lastError;
+        subscriptions.add(
+          vmService.onStderrEventWithHistory.listen((Event e) {
+            if (lastError case final last?
+                when last.timestamp == e.timestamp && last.bytes == e.bytes) {
+              // Looks like a duplicate event, on Dart 3.7 stable we get these.
+              return;
+            }
+            lastError = e;
+            final message = decodeBase64(e.bytes!);
+            // TODO(https://github.com/dart-lang/ai/issues/57): consider
+            // pruning this content down to only what is useful for the LLM to
+            // understand the error and its source.
+            errorsController.add(message);
+          }),
+        );
+
+        await [
+          vmService.streamListen(EventStreams.kExtension),
+          vmService.streamListen(EventStreams.kIsolate),
+          vmService.streamListen(EventStreams.kStderr),
+          vmService.streamListen(EventStreams.kService),
+        ].wait;
+
+        final vm = await vmService.getVM();
+        final isolate = await vmService.getIsolate(vm.isolates!.first.id!);
+        for (final extension in isolate.extensionRPCs ?? <String>[]) {
+          registeredServices[extension] = null;
+        }
+      } catch (e) {
+        logger.log(LoggingLevel.error, 'Error subscribing to app errors: $e');
+      }
+      return _AppListener._(
+        errorLog,
+        registeredServices,
+        serviceRegistrations,
+        errorsController,
+        subscriptions,
+        vmService,
+      );
+    }();
+  }
+
+  /// Returns a future that completes with the registered method name for the
+  /// given [serviceName].
+  Future<String?> waitForServiceRegistration(
+    String serviceName, {
+    Duration timeout = const Duration(seconds: 1),
+  }) async {
+    if (registeredServices.containsKey(serviceName)) {
+      return registeredServices[serviceName];
+    }
+    final completer = Completer<String?>();
+    _pendingServiceRequests.putIfAbsent(serviceName, () => []).add(completer);
+
+    return completer.future.timeout(
+      timeout,
+      onTimeout: () {
+        // Important: Clean up the completer from the list on timeout.
+        _pendingServiceRequests[serviceName]?.remove(completer);
+        if (_pendingServiceRequests[serviceName]?.isEmpty ?? false) {
+          _pendingServiceRequests.remove(serviceName);
+        }
+        return null; // Return null on timeout
+      },
+    );
+  }
+
+  Future<void> shutdown() async {
+    errorLog.clear();
+    registeredServices.clear();
+    serviceRegistrations.clear();
+    await _errorsController.close();
+    await Future.wait(_subscriptions.map((s) => s.cancel()));
+    try {
+      await [
+        _vmService.streamCancel(EventStreams.kExtension),
+        _vmService.streamCancel(EventStreams.kIsolate),
+        _vmService.streamCancel(EventStreams.kStderr),
+        _vmService.streamCancel(EventStreams.kService),
+      ].wait;
+    } on RPCError catch (_) {
+      // The vm service might already be disposed which could cause these to
+      // fail.
+    }
+  }
+}
+
+/// Manages a log of errors with a maximum size in terms of total characters.
+@visibleForTesting
+class ErrorLog {
+  Iterable<String> get errors => _errors;
+  final List<String> _errors = [];
+  int _characters = 0;
+
+  /// The number of characters used by all errors in the log.
+  @visibleForTesting
+  int get characters => _characters;
+
+  final int _maxSize;
+
+  ErrorLog({this._maxSize = 20000});
+
+  /// Adds a new [error] to the log.
+  void add(String error) {
+    if (error.length > _maxSize) {
+      // If we get a single error over the max size, just trim it and clear
+      // all other errors.
+      final trimmed = error.substring(0, _maxSize);
+      _errors.clear();
+      _characters = trimmed.length;
+      _errors.add(trimmed);
+    } else {
+      // Otherwise, we append the error and then remove as many errors from the
+      // front as we need to in order to get under the max size.
+      _characters += error.length;
+      _errors.add(error);
+      var removeCount = 0;
+      while (_characters > _maxSize) {
+        _characters -= _errors[removeCount].length;
+        removeCount++;
+      }
+      _errors.removeRange(0, removeCount);
+    }
+  }
+
+  /// Clears all errors.
+  void clear() {
+    _characters = 0;
+    _errors.clear();
+  }
+}
+
+extension on VmService {
+  static final _ids = Expando<String>();
+  static int _nextId = 0;
+  String get id => _ids[this] ??= '${_nextId++}';
+}
+
+/// Extensions to attach extra metadata to [DartToolingDaemon] instances.
+extension _DartToolingDaemonMetadata on DartToolingDaemon {
+  static final _dtdUris = Expando<Uri>();
+  static final _vmServiceUris = Expando<Set<String>>();
+  static final _supportsConnectedApps = Expando<bool>();
+  static final _activeLocations = Expando<Map<String, Object?>>();
+
+  Uri get uri => _dtdUris[this]!;
+  set uri(Uri value) => _dtdUris[this] = value;
+
+  Set<String> get vmServiceUris => _vmServiceUris[this] ??= {};
+
+  bool get supportsConnectedApps => _supportsConnectedApps[this] ?? false;
+  set supportsConnectedApps(bool value) => _supportsConnectedApps[this] = value;
+
+  Map<String, Object?>? get activeLocation => _activeLocations[this];
+  set activeLocation(Map<String, Object?>? value) =>
+      _activeLocations[this] = value;
+}
+
+extension DtdCommand on Never {
+  static const connect = 'connect';
+  static const disconnect = 'disconnect';
+  static const listConnectedApps = 'listConnectedApps';
+  static const listDtdUris = 'listDtdUris';
+}
+
+extension VmServiceCommand on Never {
+  static const connect = 'connect';
+  static const disconnect = 'disconnect';
+  static const callMethod = 'callMethod';
+  static const listRegisteredServices = 'listRegisteredServices';
+}
+
+extension on VmServiceInfo {
+  String get description =>
+      '''
+- name: ${name ?? 'Unspecified'}
+  uri: $uri
+''';
+}

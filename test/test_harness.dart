@@ -1,0 +1,687 @@
+// Copyright (c) 2025, the Dart project authors.  Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io' as io show File;
+import 'dart:io' hide File;
+
+import 'package:async/async.dart';
+import 'package:dart_mcp/client.dart';
+import 'package:dart_mcp/stdio.dart';
+import 'package:dartnative_mcp/src/features_configuration.dart';
+import 'package:dartnative_mcp/src/mixins/dtd.dart';
+import 'package:dartnative_mcp/src/server.dart';
+import 'package:dartnative_mcp/src/utils/names.dart';
+import 'package:dartnative_mcp/src/utils/sdk.dart';
+import 'package:dtd/dtd.dart';
+import 'package:file/file.dart';
+import 'package:file/local.dart';
+import 'package:file/memory.dart';
+import 'package:path/path.dart' as p;
+import 'package:process/process.dart';
+import 'package:stream_channel/stream_channel.dart';
+import 'package:test/test.dart';
+import 'package:test_process/test_process.dart';
+import 'package:unified_analytics/unified_analytics.dart';
+
+Future<T> callWithRetry<T>(
+  FutureOr<T> Function() fn, {
+  int maxTries = 5,
+  bool Function(T)? retryUntil,
+}) async {
+  var tryCount = 0;
+  while (true) {
+    try {
+      final result = await fn();
+      if (retryUntil?.call(result) == false) {
+        throw StateError('Retry condition not met');
+      }
+      return result;
+    } catch (_) {
+      if (tryCount++ >= maxTries) rethrow;
+    }
+    await Future<void>.delayed(Duration(milliseconds: 100 * tryCount));
+  }
+}
+
+/// A full environment for integration testing the MCP server.
+///
+/// - Runs the counter app at `test_fixtures/counter_app` using `dn run`.
+/// - Connects to the dtd service and registers a fake `Editor.getDebugSessions`
+///   extension method on it to mimic the DartCode extension.
+/// - Sets up the MCP client and server, and fully initializes the connection
+///   between them. Includes a debug mode for running them both in process to
+///   allow for breakpoints, but the default mode is to run the server in a
+///   separate process.
+class TestHarness {
+  final FakeEditorExtension? fakeEditorExtension;
+  final DartToolingMCPClient mcpClient;
+  final ServerConnectionPair serverConnectionPair;
+  final FileSystem fileSystem;
+  final Sdk sdk;
+
+  ServerConnection get mcpServerConnection =>
+      serverConnectionPair.serverConnection;
+
+  TestHarness._(
+    this.mcpClient,
+    this.serverConnectionPair,
+    this.fakeEditorExtension,
+    this.fileSystem,
+    this.sdk,
+  );
+
+  /// Starts a Dart Tooling Daemon as well as an MCP client and server, and
+  /// a [FakeEditorExtension] to manage registering debug sessions.
+  ///
+  /// Handles the initialization handshake between the MCP client and server as
+  /// well.
+  ///
+  /// By default this will run with the MCP server compiled as a separate binary
+  /// to mimic as closely as possible the real world behavior. Set `inProcess`
+  /// to true to run the MCP server in the same isolate as the test. This will
+  /// allow for testing the logic inside of the MCP server support mixins.
+  /// Setting this to true is also useful for local debugging of tests that run
+  /// the MCP server as a separate binary, since breakpoints will work when the
+  /// MCP server is ran in process.
+  ///
+  /// Use [startDebugSession] to start up apps and connect to them.
+  ///
+  /// If [cliArgs] are passed, they will be given to the MCP server. This is
+  /// only supported when [inProcess] is `false`, which is enforced via
+  /// assertions.
+  ///
+  /// The [processManager] defaults to a [TestProcessManager], but you can
+  /// override it to use a real [ProcessManager].
+  static Future<TestHarness> start({
+    bool inProcess = false,
+    FileSystem? fileSystem,
+    ProcessManager? processManager,
+    List<String> cliArgs = const [],
+    Sdk? sdk,
+    bool startFakeEditorExtension = true,
+    FeaturesConfiguration featuresConfig = const FeaturesConfiguration(),
+  }) async {
+    sdk ??= Sdk.find();
+    fileSystem ??= const LocalFileSystem();
+    processManager ??= TestProcessManager();
+
+    final mcpClient = DartToolingMCPClient();
+    addTearDown(mcpClient.shutdown);
+
+    final serverConnectionPair = await _initializeMCPServer(
+      mcpClient,
+      inProcess,
+      fileSystem,
+      processManager,
+      sdk,
+      cliArgs,
+      featuresConfig,
+    );
+    final connection = serverConnectionPair.serverConnection;
+    connection.onLog.listen((log) {
+      printOnFailure('MCP Server Log: $log');
+    });
+
+    final fakeEditorExtension = startFakeEditorExtension
+        ? await FakeEditorExtension.connect(sdk)
+        : null;
+    if (fakeEditorExtension != null) {
+      addTearDown(fakeEditorExtension.shutdown);
+    }
+
+    return TestHarness._(
+      mcpClient,
+      serverConnectionPair,
+      fakeEditorExtension,
+      fileSystem,
+      sdk,
+    );
+  }
+
+  /// Starts an app debug session.
+  Future<AppDebugSession> startDebugSession(
+    String projectRoot,
+    String appPath, {
+    required bool isDartNative,
+    List<String> args = const [],
+    FakeEditorExtension? editorExtension,
+  }) async {
+    final session = await AppDebugSession._start(
+      projectRoot,
+      appPath,
+      isDartNative: isDartNative,
+      args: args,
+      sdk: sdk,
+    );
+    await (editorExtension ?? fakeEditorExtension)?.addDebugSession(session);
+    final root = rootForPath(projectRoot);
+    final roots = (await mcpClient.handleListRoots(ListRootsRequest())).roots;
+    if (!roots.any((r) => r.uri == root.uri)) {
+      mcpClient.addRoot(root);
+    }
+    return session;
+  }
+
+  /// Creates a canonical [Root] object for a given [projectPath].
+  Root rootForPath(String projectPath) =>
+      Root(uri: fileSystem.directory(projectPath).absolute.uri.toString());
+
+  /// Stops an app debug session.
+  Future<void> stopDebugSession(
+    AppDebugSession session, {
+    FakeEditorExtension? editorExtension,
+  }) async {
+    await (editorExtension ?? fakeEditorExtension)?.removeDebugSession(session);
+    await AppDebugSession.kill(session.appProcess, session.isDartNative);
+  }
+
+  /// Connects the MCP server to the dart tooling daemon at the [dtdUri] using
+  /// the "connectDartToolingDaemon" tool function.
+  ///
+  /// By default the DTD Uri will come from the [fakeEditorExtension].
+  ///
+  /// This mimics a user using the "copy DTD Uri from clipboard" action.
+  Future<CallToolResult> connectToDtd({
+    String? dtdUri,
+    bool expectError = false,
+  }) async {
+    final tools = (await mcpServerConnection.listTools()).tools;
+
+    final dtdTool = tools.singleWhere(
+      (t) => t.name == DartToolingDaemonSupport.dtdTool.name,
+    );
+
+    final result = await callToolWithRetry(
+      CallToolRequest(
+        name: dtdTool.name,
+        arguments: {
+          ParameterNames.command: DtdCommand.connect,
+          ParameterNames.uri: dtdUri ?? fakeEditorExtension?.dtdUri,
+        },
+      ),
+      expectError: expectError,
+    );
+    return result;
+  }
+
+  /// Helper to send [request] to [mcpServerConnection].
+  ///
+  /// Some methods will fail if the DTD connection is not yet ready.
+  Future<CallToolResult> callTool(
+    CallToolRequest request, {
+    bool expectError = false,
+  }) async {
+    final result = await mcpServerConnection.callTool(request);
+    expect(
+      result.isError,
+      expectError ? true : isNot(isTrue),
+      reason: result.content.join('\n'),
+    );
+    return result;
+  }
+
+  /// Sends [request] to [mcpServerConnection], retrying [maxTries] times.
+  ///
+  /// Some methods will fail if the DTD connection is not yet ready.
+  Future<CallToolResult> callToolWithRetry(
+    CallToolRequest request, {
+    int maxTries = 5,
+    bool expectError = false,
+    bool Function(CallToolResult)? retryUntil,
+  }) => callWithRetry(
+    () => callTool(request, expectError: expectError),
+    maxTries: maxTries,
+    retryUntil: retryUntil,
+  );
+
+  /// Calls [getPrompt] on the [mcpServerConnection].
+  Future<GetPromptResult> getPrompt(GetPromptRequest request) =>
+      mcpServerConnection.getPrompt(request);
+}
+
+/// The debug session for a single app.
+///
+/// Should be started using [TestHarness.startDebugSession].
+final class AppDebugSession {
+  final TestProcess appProcess;
+  final String appPath;
+  final String projectRoot;
+  final String vmServiceUri;
+  final bool isDartNative;
+  final String id;
+
+  AppDebugSession._({
+    required this.appProcess,
+    required this.vmServiceUri,
+    required this.projectRoot,
+    required this.appPath,
+    required this.isDartNative,
+    required this.id,
+  });
+
+  static Future<AppDebugSession> _start(
+    String projectRoot,
+    String appPath, {
+    List<String> args = const [],
+    required bool isDartNative,
+    required Sdk sdk,
+  }) async {
+    final process = await TestProcess.start(
+      isDartNative ? sdk.dnExecutablePath : sdk.dartExecutablePath,
+      [
+        'run',
+        if (!isDartNative) ...[
+          '--no-serve-devtools',
+          '--enable-vm-service=0',
+          '--no-pause-isolates-on-start',
+        ],
+        if (isDartNative) ...['-d', 'flutter-tester'],
+        appPath,
+        ...args,
+      ],
+      workingDirectory: projectRoot,
+    );
+
+    addTearDown(() async {
+      await kill(process, isDartNative);
+    });
+
+    String? vmServiceUri;
+    final stdout = StreamQueue(process.stdoutStream());
+    while (vmServiceUri == null && await stdout.hasNext) {
+      final line = await stdout.next;
+      final serviceString = isDartNative
+          ? 'A Dart VM Service'
+          : 'The Dart VM service';
+      if (line.contains(serviceString)) {
+        vmServiceUri = line
+            .substring(line.indexOf('http:'))
+            .replaceFirst('http:', 'ws:');
+        await stdout.cancel();
+      }
+    }
+    if (vmServiceUri == null) {
+      throw StateError(
+        'Failed to read vm service URI from the '
+        '`${isDartNative ? 'dn' : 'dart'} run` output',
+      );
+    }
+    return AppDebugSession._(
+      appProcess: process,
+      vmServiceUri: vmServiceUri,
+      projectRoot: projectRoot,
+      appPath: appPath,
+      isDartNative: isDartNative,
+      id: FakeEditorExtension.nextId.toString(),
+    );
+  }
+
+  /// Gracefully shuts down the [process].
+  ///
+  /// Note: this method may be called more than once for the same process
+  /// because [_start] registers its own [addTearDown] and some tests also
+  /// call [TestHarness.stopDebugSession] in their tearDown. The try/catch
+  /// around stdin operations handles the case where stdin is already closed
+  /// from a prior call.
+  static Future<void> kill(TestProcess process, bool isDartNative) async {
+    if (isDartNative) {
+      try {
+        process.stdin.writeln('q');
+        // ignore: avoid_catching_errors
+      } on StateError catch (_) {
+        // stdin already closed from a prior kill() call.
+      }
+      try {
+        await process.shouldExit(0).timeout(const Duration(seconds: 10));
+      } on TimeoutException catch (_) {
+        await process.kill();
+        await process.shouldExit();
+      }
+    } else {
+      // Send q which triggers graceful shutdown in our test scripts
+      try {
+        process.stdin.writeln('q');
+        // Also close stdin for scripts listening to onDone
+        await process.stdin.close();
+        // ignore: avoid_catching_errors
+      } on StateError catch (_) {
+        // stdin already closed from a prior kill() call.
+      }
+      try {
+        await process.shouldExit().timeout(const Duration(seconds: 10));
+      } on TimeoutException catch (_) {
+        await process.kill();
+        await process.shouldExit();
+      }
+    }
+  }
+}
+
+/// A basic MCP client which is started as a part of the harness.
+final class DartToolingMCPClient extends MCPClient
+    with RootsSupport, SamplingSupport, ElicitationFormSupport {
+  DartToolingMCPClient()
+    : super(
+        Implementation(
+          name: 'test client for the dart tooling mcp server',
+          version: '0.1.0',
+        ),
+      );
+
+  @override
+  FutureOr<CreateMessageResult> handleCreateMessage(
+    CreateMessageRequest request,
+    Implementation serverInfo,
+  ) {
+    final messageTexts = request.messages
+        .map((message) {
+          final role = message.role.name;
+          return switch (message.content) {
+            final TextContent c when c.isText => '[$role] ${c.text}',
+            final ImageContent c when c.isImage => '[$role] ${c.mimeType}',
+            final AudioContent c when c.isAudio => '[$role] ${c.mimeType}',
+            final EmbeddedResource c when c.isEmbeddedResource =>
+              '[$role] ${c.resource.uri}',
+            _ => 'UNKNOWN',
+          };
+        })
+        .join('\n');
+    return CreateMessageResult(
+      role: Role.assistant,
+      content: Content.text(
+        text: 'TOKENS: ${request.maxTokens}\n$messageTexts',
+      ),
+      model: 'test-model',
+    );
+  }
+
+  final List<ElicitationHandler> _elicitationHandlers = [];
+
+  /// Registers a handler for elicitation requests.
+  ///
+  /// The handler will be called with the elicitation request, and should return
+  /// a result or null. If null is returned, the next handler will be called.
+  void registerElicitationHandler(ElicitationHandler handler) {
+    _elicitationHandlers.add(handler);
+  }
+
+  /// Passes the [request] to all registered handlers, and returns the first
+  /// non-null result.
+  ///
+  /// If no handlers return a result, returns a result with the action set to
+  /// [ElicitationAction.cancel].
+  @override
+  Future<ElicitResult> handleElicitation(ElicitRequest request, _) async {
+    for (final handler in _elicitationHandlers) {
+      final result = await handler(request);
+      if (result != null) {
+        return result;
+      }
+    }
+    return ElicitResult(action: ElicitationAction.cancel);
+  }
+}
+
+/// A handler for elicitation requests.
+typedef ElicitationHandler =
+    FutureOr<ElicitResult?> Function(ElicitRequest request);
+
+/// The dart tooling daemon currently expects to get vm service URIs through
+/// the `Editor.getDebugSessions` DTD extension.
+///
+/// This class registers a similar extension for a normal `dn run` process,
+/// without having the normal editor extension in place.
+class FakeEditorExtension {
+  Iterable<AppDebugSession> get debugSessions => _debugSessions;
+  final List<AppDebugSession> _debugSessions = [];
+  final TestProcess dtdProcess;
+  final DartToolingDaemon dtd;
+  final String dtdUri;
+  final String dtdSecret;
+
+  FakeEditorExtension._(this.dtd, this.dtdProcess, this.dtdUri, this.dtdSecret);
+
+  static int get nextId => ++_nextId;
+  static int _nextId = 0;
+
+  static Future<FakeEditorExtension> connect(Sdk sdk) async {
+    final dtdProcess = await TestProcess.start(sdk.dartExecutablePath, [
+      'tooling-daemon',
+      '--machine',
+    ]);
+    final (:dtdUri, :dtdSecret) = await _getDTDInfo(dtdProcess);
+    final dtd = await DartToolingDaemon.connect(Uri.parse(dtdUri));
+    return FakeEditorExtension._(dtd, dtdProcess, dtdUri, dtdSecret);
+  }
+
+  Future<void> addDebugSession(AppDebugSession session) async {
+    _debugSessions.add(session);
+    await dtd.registerVmService(
+      uri: session.vmServiceUri,
+      secret: dtdSecret,
+      name: session.id,
+    );
+  }
+
+  Future<void> removeDebugSession(AppDebugSession session) async {
+    if (_debugSessions.remove(session)) {
+      await dtd.unregisterVmService(
+        uri: session.vmServiceUri,
+        secret: dtdSecret,
+      );
+    }
+  }
+
+  Future<void> shutdown() async {
+    await _debugSessions.toList().map(removeDebugSession).wait;
+    await dtd.close();
+    try {
+      await dtdProcess.stdin.close();
+    } catch (_) {
+      // stdin already closed
+    }
+    try {
+      await dtdProcess.shouldExit().timeout(const Duration(seconds: 5));
+    } on TimeoutException catch (_) {
+      await dtdProcess.kill();
+      await dtdProcess.shouldExit();
+    }
+  }
+}
+
+/// Reads DTD uri from the [dtdProcess] output.
+Future<({String dtdUri, String dtdSecret})> _getDTDInfo(
+  TestProcess dtdProcess,
+) async {
+  final decoded =
+      jsonDecode(await dtdProcess.stdoutStream().first) as Map<String, Object?>;
+  final details = decoded['tooling_daemon_details'] as Map<String, Object?>;
+  return (
+    dtdUri: details['uri'] as String,
+    dtdSecret: details['trusted_client_secret'] as String,
+  );
+}
+
+typedef ServerConnectionPair = ({
+  ServerConnection serverConnection,
+  DartNativeMCPServer? server,
+});
+
+/// Starts up the [DartNativeMCPServer] and connects [client] to it.
+///
+/// Also handles the full intialization handshake between the client and
+/// server.
+Future<ServerConnectionPair> _initializeMCPServer(
+  MCPClient client,
+  bool inProcess,
+  FileSystem fileSystem,
+  ProcessManager processManager,
+  Sdk sdk,
+  List<String> cliArgs,
+  FeaturesConfiguration featuresConfig,
+) async {
+  ServerConnection connection;
+  DartNativeMCPServer? server;
+  if (inProcess) {
+    assert(cliArgs.isEmpty);
+
+    /// The client side of the communication channel - the stream is the
+    /// incoming data and the sink is outgoing data.
+    final clientController = StreamController<String>();
+
+    /// The server side of the communication channel - the stream is the
+    /// incoming data and the sink is outgoing data.
+    final serverController = StreamController<String>();
+
+    late final clientChannel = StreamChannel<String>.withCloseGuarantee(
+      serverController.stream,
+      clientController.sink,
+    );
+    late final serverChannel = StreamChannel<String>.withCloseGuarantee(
+      clientController.stream,
+      serverController.sink,
+    );
+    final analyticsFileSystem = MemoryFileSystem();
+    final analyticsHomeDir = analyticsFileSystem.directory('home');
+    late Analytics analytics;
+    // Need to create it twice, for the first run analytics are never sent.
+    for (var i = 0; i < 2; i++) {
+      analytics = Analytics.fake(
+        tool: DashTool.dartTool,
+        dartVersion: Platform.version.substring(
+          0,
+          Platform.version.indexOf(' '),
+        ),
+        fs: analyticsFileSystem,
+        homeDirectory: analyticsHomeDir,
+        toolsMessageVersion: -2, // Required or else analytics are disabled
+      );
+    }
+    // Required to enable telemetry
+    analytics.clientShowedMessage();
+    expect(analytics.okToSend, true);
+
+    server = DartNativeMCPServer(
+      serverChannel,
+      featuresConfig: featuresConfig,
+      processManager: processManager,
+      fileSystem: fileSystem,
+      sdk: sdk,
+      analytics: analytics,
+    );
+    addTearDown(server.shutdown);
+    connection = client.connectServer(clientChannel);
+  } else {
+    final process = await Process.start(sdk.dartExecutablePath, [
+      'pub', // Using `pub` gives us incremental compilation
+      'run',
+      'bin/dartnative_mcp.dart',
+      ...cliArgs,
+      for (var enabled in featuresConfig.enabledNames) '--enable=$enabled',
+      for (var disabled in featuresConfig.disabledNames) '--disable=$disabled',
+    ]);
+    addTearDown(() async {
+      try {
+        await process.stdin.close();
+      } catch (_) {
+        // stdin already closed
+      }
+      try {
+        await process.exitCode.timeout(const Duration(seconds: 5));
+      } on TimeoutException catch (_) {
+        process.kill();
+        await process.exitCode;
+      }
+    });
+    connection = client.connectServer(
+      stdioChannel(input: process.stdout, output: process.stdin),
+    );
+    unawaited(
+      connection.done.then((_) async {
+        process.kill();
+        await process.exitCode;
+      }),
+    );
+  }
+
+  final initializeResult = await connection.initialize(
+    InitializeRequest(
+      protocolVersion: ProtocolVersion.latestSupported,
+      capabilities: client.capabilities,
+      clientInfo: client.implementation,
+    ),
+  );
+  expect(initializeResult.protocolVersion, ProtocolVersion.latestSupported);
+  connection.notifyInitialized(InitializedNotification());
+  return (serverConnection: connection, server: server);
+}
+
+final counterAppPath = p.join('test_fixtures', 'counter_app');
+
+final dartCliAppsPath = p.join('test_fixtures', 'dart_cli_app');
+final dartAppPath = p.join('test_fixtures', 'dart_app');
+
+/// A test wrapper around [LocalProcessManager] that stores commands locally
+/// instead of running them by spawning sub-processes.
+class TestProcessManager extends LocalProcessManager {
+  TestProcessManager() {
+    addTearDown(reset);
+  }
+
+  final commandsRan = <({List<Object> command, String? workingDirectory})>[];
+
+  int nextPid = 0;
+
+  @override
+  Future<ProcessResult> run(
+    List<Object> command, {
+    String? workingDirectory,
+    Map<String, String>? environment,
+    bool includeParentEnvironment = true,
+    bool runInShell = false,
+    Encoding? stdoutEncoding = systemEncoding,
+    Encoding? stderrEncoding = systemEncoding,
+  }) async {
+    commandsRan.add((command: command, workingDirectory: workingDirectory));
+    return ProcessResult(nextPid++, 0, '', '');
+  }
+
+  void reset() {
+    commandsRan.clear();
+  }
+}
+
+Matcher equalsCommand(
+  ({List<Object> command, String? workingDirectory}) command,
+) => _CommandMatcher(command);
+
+class _CommandMatcher extends Matcher {
+  final ({List<Object> command, String? workingDirectory}) value;
+
+  _CommandMatcher(this.value);
+
+  @override
+  Description describe(Description description) => description;
+
+  @override
+  bool matches(Object? item, Map matchState) {
+    if (item is! ({List<Object> command, String? workingDirectory})) {
+      return false;
+    }
+    if (item.workingDirectory != value.workingDirectory) {
+      return false;
+    }
+    if (!equals(value.command).matches(item.command, matchState)) {
+      return false;
+    }
+    return true;
+  }
+}
+
+extension RootPath on Root {
+  /// Get the OS specific file path for this root.
+  String get path => io.File.fromUri(Uri.parse(uri)).path;
+}

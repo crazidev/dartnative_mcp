@@ -1,0 +1,350 @@
+// Copyright (c) 2025, the Dart project authors.  Please see the AUTHORS file
+// for details. All rights reserved. Use of this source code is governed by a
+// BSD-style license that can be found in the LICENSE file.
+
+import 'dart:io' hide File;
+import 'dart:io' as io show File;
+
+import 'package:dart_mcp/server.dart';
+import 'package:dartnative_mcp/src/features_configuration.dart';
+import 'package:dartnative_mcp/src/mixins/pub.dart';
+import 'package:dartnative_mcp/src/utils/names.dart';
+import 'package:file/file.dart';
+import 'package:file/memory.dart';
+import 'package:path/path.dart' as p;
+import 'package:test/test.dart';
+
+import '../test_harness.dart';
+
+void main() {
+  test('pub tools are enabled by default', () async {
+    final featureConfig = const FeaturesConfiguration();
+    for (var tool in PubSupport.allTools) {
+      expect(
+        featureConfig.isEnabled(
+          tool.name,
+          tool.enabledByDefault,
+          tool.categories,
+        ),
+        isTrue,
+        reason: 'Tool ${tool.name} should be enabled by default',
+      );
+    }
+  });
+
+  final fakeAppPath = io.File.fromUri(Uri.parse('/fake_app/')).path;
+
+  for (final appKind in const ['dart', 'dartnative']) {
+    final executableName = switch (appKind) {
+      'dart' => 'dart${Platform.isWindows ? '.exe' : ''}',
+      _ => 'dn${Platform.isWindows ? '.bat' : ''}',
+    };
+    group('$appKind app', () {
+      late TestHarness testHarness;
+      late TestProcessManager testProcessManager;
+      late Root testRoot;
+      late Tool dartPubTool;
+      late FileSystem fileSystem;
+
+      // TODO: Use setUpAll, currently this fails due to an apparent TestProcess
+      // issue.
+      setUp(() async {
+        fileSystem = MemoryFileSystem(
+          style: Platform.isWindows
+              ? FileSystemStyle.windows
+              : FileSystemStyle.posix,
+        );
+        fileSystem.file(p.join(fakeAppPath, 'pubspec.yaml'))
+          ..createSync(recursive: true)
+          ..writeAsStringSync(
+            appKind == 'dartnative' ? dartNativePubspec : dartPubspec,
+          );
+        testHarness = await TestHarness.start(
+          inProcess: true,
+          fileSystem: fileSystem,
+          featuresConfig: FeaturesConfiguration(
+            enabledNames: {PubSupport.pubTool.name},
+          ),
+        );
+        testProcessManager =
+            testHarness.serverConnectionPair.server!.processManager
+                as TestProcessManager;
+        testRoot = testHarness.rootForPath(fakeAppPath);
+
+        testHarness.mcpClient.addRoot(testRoot);
+        await pumpEventQueue();
+
+        final tools = (await testHarness.mcpServerConnection.listTools()).tools;
+        dartPubTool = tools.singleWhere(
+          (t) => t.name == PubSupport.pubTool.name,
+        );
+      });
+
+      group('pub tools', () {
+        test('add', () async {
+          final request = CallToolRequest(
+            name: dartPubTool.name,
+            arguments: {
+              ParameterNames.command: 'add',
+              ParameterNames.packageNames: ['foo', 'bar'],
+              ParameterNames.roots: [
+                {ParameterNames.root: testRoot.uri},
+              ],
+            },
+          );
+          final result = await testHarness.callToolWithRetry(request);
+
+          // Verify the command was sent to the process manager without error.
+          expect(result.isError, isNot(true));
+          expect(testProcessManager.commandsRan, [
+            equalsCommand((
+              command: [
+                endsWith(executableName),
+                'pub',
+                'add',
+                '--',
+                'foo',
+                'bar',
+              ],
+              workingDirectory: testRoot.path,
+            )),
+          ]);
+        });
+
+        test('remove', () async {
+          final request = CallToolRequest(
+            name: dartPubTool.name,
+            arguments: {
+              ParameterNames.command: 'remove',
+              ParameterNames.packageNames: ['foo', 'bar'],
+              ParameterNames.roots: [
+                {ParameterNames.root: testRoot.uri},
+              ],
+            },
+          );
+          final result = await testHarness.callToolWithRetry(request);
+
+          // Verify the command was sent to the process manager without error.
+          expect(result.isError, isNot(true));
+          expect(testProcessManager.commandsRan, [
+            equalsCommand((
+              command: [
+                endsWith(executableName),
+                'pub',
+                'remove',
+                '--',
+                'foo',
+                'bar',
+              ],
+              workingDirectory: testRoot.path,
+            )),
+          ]);
+        });
+
+        test('get', () async {
+          final request = CallToolRequest(
+            name: dartPubTool.name,
+            arguments: {
+              ParameterNames.command: 'get',
+              ParameterNames.roots: [
+                {ParameterNames.root: testRoot.uri},
+              ],
+            },
+          );
+          final result = await testHarness.callToolWithRetry(request);
+
+          // Verify the command was sent to the process manager without error.
+          expect(result.isError, isNot(true));
+          expect(testProcessManager.commandsRan, [
+            equalsCommand((
+              command: [endsWith(executableName), 'pub', 'get'],
+              workingDirectory: testRoot.path,
+            )),
+          ]);
+        });
+
+        test('upgrade', () async {
+          final request = CallToolRequest(
+            name: dartPubTool.name,
+            arguments: {
+              ParameterNames.command: 'upgrade',
+              ParameterNames.roots: [
+                {ParameterNames.root: testRoot.uri},
+              ],
+            },
+          );
+          final result = await testHarness.callToolWithRetry(request);
+
+          // Verify the command was sent to the process manager without error.
+          expect(result.isError, isNot(true));
+          expect(testProcessManager.commandsRan, [
+            equalsCommand((
+              command: [endsWith(executableName), 'pub', 'upgrade'],
+              workingDirectory: testRoot.path,
+            )),
+          ]);
+        });
+
+        test('deps', () async {
+          final request = CallToolRequest(
+            name: dartPubTool.name,
+            arguments: {
+              ParameterNames.command: 'deps',
+              ParameterNames.roots: [
+                {ParameterNames.root: testRoot.uri},
+              ],
+            },
+          );
+          final result = await testHarness.callToolWithRetry(request);
+
+          // Verify the command was sent to the process manager without error.
+          expect(result.isError, isNot(true));
+          expect(testProcessManager.commandsRan, [
+            equalsCommand((
+              command: [endsWith(executableName), 'pub', 'deps'],
+              workingDirectory: testRoot.path,
+            )),
+          ]);
+        });
+
+        test('outdated', () async {
+          final request = CallToolRequest(
+            name: dartPubTool.name,
+            arguments: {
+              ParameterNames.command: 'outdated',
+              ParameterNames.roots: [
+                {ParameterNames.root: testRoot.uri},
+              ],
+            },
+          );
+          final result = await testHarness.callToolWithRetry(request);
+
+          // Verify the command was sent to the process manager without error.
+          expect(result.isError, isNot(true));
+          expect(testProcessManager.commandsRan, [
+            equalsCommand((
+              command: [endsWith(executableName), 'pub', 'outdated'],
+              workingDirectory: testRoot.path,
+            )),
+          ]);
+        });
+
+        test('in a subdir of an a root', () async {
+          fileSystem.file(p.join(fakeAppPath, 'subdir', 'pubspec.yaml'))
+            ..createSync(recursive: true)
+            ..writeAsStringSync(
+              appKind == 'dartnative' ? dartNativePubspec : dartPubspec,
+            );
+          final request = CallToolRequest(
+            name: dartPubTool.name,
+            arguments: {
+              ParameterNames.command: 'get',
+              ParameterNames.roots: [
+                {ParameterNames.root: p.join(testRoot.uri, 'subdir')},
+              ],
+            },
+          );
+          final result = await testHarness.callToolWithRetry(request);
+
+          // Verify the command was sent to the process manager without error.
+          expect(result.isError, isNot(true));
+          expect(testProcessManager.commandsRan, [
+            equalsCommand((
+              command: [endsWith(executableName), 'pub', 'get'],
+              workingDirectory: p.join(fakeAppPath, 'subdir'),
+            )),
+          ]);
+        });
+
+        group('returns error', () {
+          test('for missing command', () async {
+            final request = CallToolRequest(name: dartPubTool.name);
+            final result = await testHarness.callTool(
+              request,
+              expectError: true,
+            );
+
+            expect(
+              (result.content.last as TextContent).text,
+              'Required property "command" is missing at path #root',
+            );
+            expect(testProcessManager.commandsRan, isEmpty);
+          });
+
+          test('for unsupported command', () async {
+            final request = CallToolRequest(
+              name: dartPubTool.name,
+              arguments: {ParameterNames.command: 'publish'},
+            );
+            final result = await testHarness.callTool(
+              request,
+              expectError: true,
+            );
+
+            expect(
+              (result.content.last as TextContent).text,
+              contains('String "publish" is not one of the allowed values:'),
+            );
+            expect(testProcessManager.commandsRan, isEmpty);
+          });
+
+          for (final command in SupportedPubCommand.values.where(
+            (c) => c.requiresPackageNames,
+          )) {
+            test('for missing package name: $command', () async {
+              final request = CallToolRequest(
+                name: dartPubTool.name,
+                arguments: {ParameterNames.command: command.name},
+              );
+              final result = await testHarness.callTool(
+                request,
+                expectError: true,
+              );
+
+              expect(
+                (result.content.last as TextContent).text,
+                'Missing required argument `packageNames` for the '
+                '`${command.name}` command.',
+              );
+              expect(testProcessManager.commandsRan, isEmpty);
+            });
+          }
+
+          test('for package name starting with -', () async {
+            final request = CallToolRequest(
+              name: dartPubTool.name,
+              arguments: {
+                ParameterNames.command: 'add',
+                ParameterNames.packageNames: ['-foo'],
+              },
+            );
+            final result = await testHarness.callTool(
+              request,
+              expectError: true,
+            );
+
+            expect(
+              (result.content.last as TextContent).text,
+              contains('Invalid `packageNames` entries: -foo.'),
+            );
+            expect(testProcessManager.commandsRan, isEmpty);
+          });
+        });
+      });
+    });
+  }
+}
+
+final dartPubspec = '''
+name: dart_app
+environment:
+  sdk: ^3.7.0
+''';
+
+final dartNativePubspec = '''
+name: dartnative_app
+environment:
+  sdk: ^3.7.0
+dependencies:
+  dartnative: ^1.0.0
+''';
