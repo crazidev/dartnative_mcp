@@ -5,9 +5,15 @@
 import 'dart:io';
 
 import 'package:dartnative_mcp/dartnative_mcp.dart';
+import 'package:dartnative_mcp/src/install.dart';
 import 'package:unified_analytics/unified_analytics.dart';
 
 void main(List<String> args) async {
+  if (args.isNotEmpty && args.first == 'install') {
+    exitCode = await runInstall(args.sublist(1));
+    return;
+  }
+
   DashTool? tool;
   if (Platform.environment[DashEnvVar.tool.name] case final toolEnv?) {
     try {
