@@ -185,16 +185,20 @@ Future<int> runInstall(List<String> args) async {
 
   // Copy skills.
   final skillSource = File(p.join(packageRoot, 'skills', skillName, 'SKILL.md'));
-  final skillTargets = <String>[
-    p.join('.agents', 'skills', skillName),
-    p.join('.cursor', 'skills', skillName),
-    p.join('.claude', 'skills', skillName),
+  final skillTargetMap = <Map<String, String>>[
+    {'target': p.join('.agents', 'skills', skillName), 'ide': 'opencode'},
+    {'target': p.join('.cursor', 'skills', skillName), 'ide': 'cursor'},
+    {'target': p.join('.claude', 'skills', skillName), 'ide': 'claude'},
   ];
+  final copiedSkills = <String>[];
   if (skillSource.existsSync()) {
-    for (final target in skillTargets) {
+    for (final entry in skillTargetMap) {
+      if (!selectedIds.contains(entry['ide'])) continue;
+      final target = entry['target']!;
       final dir = Directory(p.join(projectDir, target));
       dir.createSync(recursive: true);
       File(p.join(projectDir, target, 'SKILL.md')).writeAsStringSync(skillSource.readAsStringSync());
+      copiedSkills.add(target);
     }
   }
 
@@ -205,7 +209,11 @@ Future<int> runInstall(List<String> args) async {
   stdout.writeln('  Launcher: ${isWin ? '.dartnative\\mcp.bin.cmd' : '.dartnative/mcp.bin'}');
   stdout.writeln('  IDEs: ${selectedIds.join(', ')}');
   for (final f in written) stdout.writeln('  Config: $f');
-  stdout.writeln('  Skills: ${skillTargets.map((t) => '$t/SKILL.md').join(', ')}');
+  if (copiedSkills.isNotEmpty) {
+    stdout.writeln('  Skills: ${copiedSkills.map((t) => '$t/SKILL.md').join(', ')}');
+  } else {
+    stdout.writeln('  Skills: (none for selected IDEs)');
+  }
   stdout.writeln('Restart your MCP client to connect.');
   return 0;
 }
