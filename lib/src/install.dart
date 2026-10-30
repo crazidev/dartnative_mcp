@@ -114,8 +114,8 @@ Future<int> runInstall(List<String> args) async {
   launcherDir.createSync(recursive: true);
   final isWin = Platform.isWindows;
   final launcherPath = isWin
-      ? p.join(projectDir, '.dart_tool', 'mcp.bin.cmd')
-      : p.join(projectDir, '.dart_tool', 'mcp.bin');
+      ? p.join(projectDir, '.dart_tool', 'dartnative_mcp.cmd')
+      : p.join(projectDir, '.dart_tool', 'dartnative_mcp');
   final dnArg = dnSdkPath != null ? ' --dn-sdk ${_sh(dnSdkPath)}' : '';
   if (isWin) {
     final pubCacheWin = Platform.environment['PUB_CACHE'];
@@ -210,7 +210,7 @@ Future<int> runInstall(List<String> args) async {
   stdout.writeln('');
   stdout.writeln('DartNative MCP server installed.');
   stdout.writeln('  Source: ${packageRoot}');
-  stdout.writeln('  Launcher: ${isWin ? '.dart_tool\\mcp.bin.cmd' : '.dart_tool/mcp.bin'}');
+  stdout.writeln('  Launcher: ${isWin ? '.dart_tool/dartnative_mcp.cmd' : '.dart_tool/dartnative_mcp'}');
   stdout.writeln('  IDEs: ${selectedIds.join(', ')}');
   for (final f in written) stdout.writeln('  Config: $f');
   if (copiedSkills.isNotEmpty) {
