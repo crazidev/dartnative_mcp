@@ -11,6 +11,7 @@ import 'package:dartnative_mcp/src/arg_parser.dart';
 import 'package:dartnative_mcp/src/features_configuration.dart';
 import 'package:dartnative_mcp/src/mixins/analyzer.dart';
 import 'package:dartnative_mcp/src/mixins/dartnative.dart';
+import 'package:dartnative_mcp/src/mixins/dartpub_search.dart';
 import 'package:dartnative_mcp/src/mixins/dash_cli.dart';
 import 'package:dartnative_mcp/src/mixins/dtd.dart';
 import 'package:dartnative_mcp/src/mixins/grep_packages.dart';
@@ -28,6 +29,7 @@ void main() {
     final allTools = [
       ...DartAnalyzerSupport.allTools,
       ...DartNativeCliSupport.allTools,
+      ...DartpubSupport.allTools,
       ...DashCliSupport.allTools,
       ...DartToolingDaemonSupport.allTools,
       ...GrepSupport.allTools,

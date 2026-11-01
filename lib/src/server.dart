@@ -25,6 +25,7 @@ import 'mixins/dash_cli.dart';
 import 'mixins/dtd.dart';
 import 'mixins/grep_packages.dart';
 import 'mixins/package_uri_reader.dart';
+import 'mixins/dartpub_search.dart';
 import 'mixins/pub.dart';
 import 'mixins/pub_dev_search.dart';
 import 'mixins/roots_fallback_support.dart';
@@ -47,6 +48,7 @@ final class DartNativeMCPServer extends MCPServer
         DartAnalyzerSupport,
         PubSupport,
         PubDevSupport,
+        DartpubSupport,
         DartToolingDaemonSupport,
         PromptsSupport,
         PackageUriSupport,
@@ -98,6 +100,18 @@ Prefer the `dn_*` tools over running shell commands: they use the DartNative
 discover devices, `${ToolNames.dnRun.name}` to launch an app, and
 `${ToolNames.dnBuild.name}` to build one.
 
+Always run `${ToolNames.analyzeFiles.name}` first before starting any work to
+discover errors, warnings, or missing dependencies. If dependencies are missing,
+run `${ToolNames.pub.name}` with command `get`.
+
+After completing code changes or any job, always run
+`${ToolNames.analyzeFiles.name}` to verify there are no remaining errors or
+warnings, and format code with `${ToolNames.dartFormat.name}`.
+
+If there are no blocker errors but there are simple lints to be fixed, use
+`${ToolNames.dartFix.name}` (or `${ToolNames.analyzeFiles.name}` with `applyFixes: true`)
+to fix them automatically instead of editing each file manually.
+
 After completing Dart/DartNative code changes, always execute a hot reload or
 hot restart.
 
@@ -111,6 +125,13 @@ will `${DtdCommand.listConnectedApps}` return any apps.
 Whenever attempting to investigate a package dependency, use the
 `${ToolNames.readPackageUris}` and `${ToolNames.ripGrepPackages}` tools to
 explore their files.
+
+To find DartNative plugins (camera, bottom sheets, app links, …), use
+`${ToolNames.dartpubSearch.name}` to query the dartpub.dev plugin registry.
+It can also return a plugin's README, example, or changelog via `detail`.
+For ordinary Dart packages, use `${ToolNames.pubDevSearch.name}` to search
+pub.dev instead.
+Install discovered dependencies using `${ToolNames.pub.name}` with command `add`.
 
 In addition to `package:` URIs, the server also supports `package-root:` URIs,
 which resolve to the root of the package instead of the `lib/` directory. These

@@ -12,9 +12,16 @@ import 'package:path/path.dart' as p;
 /// Returns the process exit code.
 Future<int> runInstall(List<String> args) async {
   final parser = ArgParser()
-    ..addOption('ides', help: 'Comma-separated IDE ids to configure (e.g. vscode,cursor).')
+    ..addOption(
+      'ides',
+      help: 'Comma-separated IDE ids to configure (e.g. vscode,cursor).',
+    )
     ..addFlag('all', help: 'Configure every detected IDE.', defaultsTo: false)
-    ..addFlag('detected', help: 'Configure only the detected IDEs.', defaultsTo: false)
+    ..addFlag(
+      'detected',
+      help: 'Configure only the detected IDEs.',
+      defaultsTo: false,
+    )
     ..addOption('dn-sdk', help: 'Path to the DartNative SDK root.')
     ..addOption('dart-sdk', help: 'Path to the Dart SDK root.')
     ..addFlag('help', abbr: 'h', help: 'Show this help.', defaultsTo: false);
@@ -30,32 +37,81 @@ Future<int> runInstall(List<String> args) async {
   if (parsed.flag('help')) {
     stdout.writeln('Usage: dartnative_mcp install [options]');
     stdout.writeln('');
-    stdout.writeln('Installs the DartNative MCP server into the current project by');
-    stdout.writeln('writing MCP client configuration for the selected IDEs and');
+    stdout.writeln(
+      'Installs the DartNative MCP server into the current project by',
+    );
+    stdout.writeln(
+      'writing MCP client configuration for the selected IDEs and',
+    );
     stdout.writeln('copying the agent skill.');
     stdout.writeln('');
     stdout.writeln(parser.usage);
     stdout.writeln('');
-    stdout.writeln('IDE ids: vscode, cursor, claude, gemini, opencode, antigravity, chatgpt');
+    stdout.writeln(
+      'IDE ids: vscode, cursor, claude, gemini, opencode, antigravity, chatgpt',
+    );
     return 0;
   }
 
   final projectDir = Directory.current.path;
   final packageRoot = _findPackageRoot();
-  final dnSdkPath = parsed.option('dn-sdk') ?? Platform.environment['DN_ROOT'] ?? Platform.environment['DARTNATIVE_ROOT'];
+  final dnSdkPath =
+      parsed.option('dn-sdk') ??
+      Platform.environment['DN_ROOT'] ??
+      Platform.environment['DARTNATIVE_ROOT'];
   final dartBinary = parsed.option('dart-sdk') != null
-      ? p.join(parsed.option('dart-sdk')!, 'bin', Platform.isWindows ? 'dart.exe' : 'dart')
+      ? p.join(
+          parsed.option('dart-sdk')!,
+          'bin',
+          Platform.isWindows ? 'dart.exe' : 'dart',
+        )
       : Platform.resolvedExecutable;
 
   final ideTargets = <_IdeTarget>[
-    _IdeTarget('vscode', 'VS Code', '.vscode', p.join('.vscode', 'mcp.json'), 'vscode'),
-    _IdeTarget('cursor', 'Cursor', '.cursor', p.join('.cursor', 'mcp.json'), 'mcpServers'),
+    _IdeTarget(
+      'vscode',
+      'VS Code',
+      '.vscode',
+      p.join('.vscode', 'mcp.json'),
+      'vscode',
+    ),
+    _IdeTarget(
+      'cursor',
+      'Cursor',
+      '.cursor',
+      p.join('.cursor', 'mcp.json'),
+      'mcpServers',
+    ),
     _IdeTarget('claude', 'Claude Code', '.claude', '.mcp.json', 'mcpServers'),
-    _IdeTarget('gemini', 'Gemini CLI', '.gemini', p.join('.gemini', 'settings.json'), 'mcpServers'),
+    _IdeTarget(
+      'gemini',
+      'Gemini CLI',
+      '.gemini',
+      p.join('.gemini', 'settings.json'),
+      'mcpServers',
+    ),
     _IdeTarget('opencode', 'OpenCode', '.', 'opencode.json', 'opencode'),
-    _IdeTarget('antigravity', 'Antigravity', '.agents', p.join('.agents', 'mcp_config.json'), 'mcpServers'),
-    _IdeTarget('codex', 'Codex', '.agents', p.join('.agents', 'mcp_config.json'), 'mcpServers'),
-    _IdeTarget('agents', 'Other agents (.agents)', '.agents', p.join('.agents', 'mcp_config.json'), 'mcpServers'),
+    _IdeTarget(
+      'antigravity',
+      'Antigravity',
+      '.agents',
+      p.join('.agents', 'mcp_config.json'),
+      'mcpServers',
+    ),
+    _IdeTarget(
+      'codex',
+      'Codex',
+      '.agents',
+      p.join('.agents', 'mcp_config.json'),
+      'mcpServers',
+    ),
+    _IdeTarget(
+      'agents',
+      'Other agents (.agents)',
+      '.agents',
+      p.join('.agents', 'mcp_config.json'),
+      'mcpServers',
+    ),
   ];
 
   bool isDetected(_IdeTarget ide) {
@@ -79,7 +135,9 @@ Future<int> runInstall(List<String> args) async {
   } else {
     // Interactive selection.
     stdout.writeln('Detected IDEs:');
-    for (final ide in detected) stdout.writeln('  * ${ide.label}');
+    for (final ide in detected) {
+      stdout.writeln('  * ${ide.label}');
+    }
     stdout.writeln('');
     stdout.writeln('Available IDEs:');
     for (var i = 0; i < ideTargets.length; i++) {
@@ -87,7 +145,9 @@ Future<int> runInstall(List<String> args) async {
       final mark = detected.contains(ide) ? '*' : ' ';
       stdout.writeln('  ${i + 1}. [$mark] ${ide.label} (${ide.id})');
     }
-    stdout.write('Select IDEs (comma-separated numbers, "all", or "detected"; default: detected): ');
+    stdout.write(
+      'Select IDEs (comma-separated numbers, "all", or "detected"; default: detected): ',
+    );
     final input = stdin.readLineSync()?.trim() ?? '';
     if (input.isEmpty || input.toLowerCase() == 'detected') {
       selectedIds = detected.map((i) => i.id).toSet();
@@ -119,8 +179,9 @@ Future<int> runInstall(List<String> args) async {
   final dnArg = dnSdkPath != null ? ' --dn-sdk ${_sh(dnSdkPath)}' : '';
   if (isWin) {
     final pubCacheWin = Platform.environment['PUB_CACHE'];
-    final pubCacheLineWin = (pubCacheWin != null && pubCacheWin.trim().isNotEmpty)
-        ? 'set "PUB_CACHE=${pubCacheWin}"\r\n'
+    final pubCacheLineWin =
+        (pubCacheWin != null && pubCacheWin.trim().isNotEmpty)
+        ? 'set "PUB_CACHE=$pubCacheWin"\r\n'
         : '';
     File(launcherPath).writeAsStringSync(
       '@echo off\r\n'
@@ -142,7 +203,9 @@ Future<int> runInstall(List<String> args) async {
     Process.runSync('chmod', ['+x', launcherPath]);
   }
 
-  final launchCommand = isWin ? (Platform.environment['ComSpec'] ?? 'cmd.exe') : launcherPath;
+  final launchCommand = isWin
+      ? (Platform.environment['ComSpec'] ?? 'cmd.exe')
+      : launcherPath;
   final launchArgs = isWin ? <String>['/c', launcherPath] : <String>[];
 
   // Write configs.
@@ -182,26 +245,36 @@ Future<int> runInstall(List<String> args) async {
         'args': launchArgs,
       };
     }
-    file.writeAsStringSync('${const JsonEncoder.withIndent('  ').convert(json)}\n');
+    file.writeAsStringSync(
+      '${const JsonEncoder.withIndent('  ').convert(json)}\n',
+    );
     written.add(ide.configPath);
   }
 
   // Copy skills.
-  final skillSource = File(p.join(packageRoot, 'skills', skillName, 'SKILL.md'));
+  final skillSourceDir = Directory(p.join(packageRoot, 'skills', skillName));
   final skillTargetMap = <Map<String, dynamic>>[
-    {'target': p.join('.agents', 'skills', skillName), 'ides': ['opencode', 'antigravity', 'codex', 'agents']},
-    {'target': p.join('.cursor', 'skills', skillName), 'ides': ['cursor']},
-    {'target': p.join('.claude', 'skills', skillName), 'ides': ['claude']},
+    {
+      'target': p.join('.agents', 'skills', skillName),
+      'ides': ['opencode', 'antigravity', 'codex', 'agents'],
+    },
+    {
+      'target': p.join('.cursor', 'skills', skillName),
+      'ides': ['cursor'],
+    },
+    {
+      'target': p.join('.claude', 'skills', skillName),
+      'ides': ['claude'],
+    },
   ];
   final copiedSkills = <String>[];
-  if (skillSource.existsSync()) {
+  if (skillSourceDir.existsSync()) {
     for (final entry in skillTargetMap) {
       final ides = entry['ides'] as List<String>;
       if (!ides.any(selectedIds.contains)) continue;
-      final target = entry['target']!;
-      final dir = Directory(p.join(projectDir, target));
-      dir.createSync(recursive: true);
-      File(p.join(projectDir, target, 'SKILL.md')).writeAsStringSync(skillSource.readAsStringSync());
+      final target = entry['target'] as String;
+      final destDir = Directory(p.join(projectDir, target));
+      _copyDirectory(skillSourceDir, destDir);
       copiedSkills.add(target);
     }
   }
@@ -209,12 +282,18 @@ Future<int> runInstall(List<String> args) async {
   // Summary.
   stdout.writeln('');
   stdout.writeln('DartNative MCP server installed.');
-  stdout.writeln('  Source: ${packageRoot}');
-  stdout.writeln('  Launcher: ${isWin ? '.dart_tool/dartnative_mcp.cmd' : '.dart_tool/dartnative_mcp'}');
+  stdout.writeln('  Source: $packageRoot');
+  stdout.writeln(
+    '  Launcher: ${isWin ? '.dart_tool/dartnative_mcp.cmd' : '.dart_tool/dartnative_mcp'}',
+  );
   stdout.writeln('  IDEs: ${selectedIds.join(', ')}');
-  for (final f in written) stdout.writeln('  Config: $f');
+  for (final f in written) {
+    stdout.writeln('  Config: $f');
+  }
   if (copiedSkills.isNotEmpty) {
-    stdout.writeln('  Skills: ${copiedSkills.map((t) => '$t/SKILL.md').join(', ')}');
+    stdout.writeln(
+      '  Skills: ${copiedSkills.map((t) => '$t/SKILL.md').join(', ')}',
+    );
   } else {
     stdout.writeln('  Skills: (none for selected IDEs)');
   }
@@ -234,7 +313,9 @@ String _findPackageRoot() {
     // global snapshot: walk up until skills/dartnative-mcp/SKILL.md exists
     var dir = binDir;
     for (var i = 0; i < 6; i++) {
-      if (File(p.join(dir.path, 'skills', 'dartnative-mcp', 'SKILL.md')).existsSync()) {
+      if (File(
+        p.join(dir.path, 'skills', 'dartnative-mcp', 'SKILL.md'),
+      ).existsSync()) {
         return dir.path;
       }
       dir = dir.parent;
@@ -251,7 +332,25 @@ class _IdeTarget {
   final String detectFolder;
   final String configPath;
   final String format;
-  _IdeTarget(this.id, this.label, this.detectFolder, this.configPath, this.format);
+  _IdeTarget(
+    this.id,
+    this.label,
+    this.detectFolder,
+    this.configPath,
+    this.format,
+  );
+}
+
+void _copyDirectory(Directory source, Directory destination) {
+  destination.createSync(recursive: true);
+  for (final entity in source.listSync(recursive: false)) {
+    final destPath = p.join(destination.path, p.basename(entity.path));
+    if (entity is Directory) {
+      _copyDirectory(entity, Directory(destPath));
+    } else if (entity is File) {
+      entity.copySync(destPath);
+    }
+  }
 }
 
 const serverName = 'dartnative';

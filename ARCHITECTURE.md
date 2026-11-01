@@ -123,6 +123,11 @@ classDiagram
         +pubDevSearch
     }
 
+    class DartpubSearchSupport {
+        <<mixin>>
+        +dartpubSearch
+    }
+
     class AnalyticsSupport {
         <<mixin>>
         +analytics
@@ -142,6 +147,7 @@ classDiagram
     DartToolingDaemonSupport <|-- DartNativeMCPServer : with
     PubSupport <|-- DartNativeMCPServer : with
     PubDevSearchSupport <|-- DartNativeMCPServer : with
+    DartpubSearchSupport <|-- DartNativeMCPServer : with
     AnalyticsSupport <|-- DartNativeMCPServer : with
 ```
 
@@ -161,7 +167,8 @@ The concrete server composes tools by mixing in specialized feature sets:
 - **`DartAnalyzerSupport`**: Static analysis of Dart code (`analyzeFiles`).
 - **`DartToolingDaemonSupport`**: Dart Tooling Daemon integration for hot reload, hot restart, runtime errors, and raw VM service calls.
 - **`PubSupport`**: Package management tools.
-- **`PubDevSearchSupport`**: Querying packages from pub.dev.
+- **`PubDevSearchSupport`**: Querying general Dart packages from pub.dev.
+- **`DartpubSupport`**: Querying the DartNative plugin registry on dartpub.dev, including per-plugin README/example/changelog retrieval.
 - **`AnalyticsSupport`**: Telemetry and usage tracking.
 
 ## Deep Dive: Key Tooling Subsystems

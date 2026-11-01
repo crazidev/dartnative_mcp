@@ -162,13 +162,19 @@ The server finds the SDKs automatically:
 | `dart_format` | `dart format` |
 | `dart_fix` | `dart fix --apply` |
 
+### Package search
+
+| Tool | Registry | Use for |
+| --- | --- | --- |
+| `dartpub_search` | dartpub.dev plugin registry | DartNative plugins, plus `readme` / `example` / `changelog` for one plugin |
+| `pub_dev_search` | pub.dev | General Dart packages, with scores, topics, and publisher |
+
 ### Analyzer and runtime
 
 `analyze_files`, `lsp`, `hover`, `resolve_workspace_symbol`,
-`signature_help`, `read_package_uris`, `rip_grep_packages`, `pub_dev_search`,
-the `dtd` tool, `hot_reload`, `hot_restart`, `get_runtime_errors`,
-`get_active_location`, and `vm_service` are inherited from the upstream
-server.
+`signature_help`, `read_package_uris`, `rip_grep_packages`, the `dtd` tool,
+`hot_reload`, `hot_restart`, `get_runtime_errors`, `get_active_location`, and
+`vm_service` are inherited from the upstream server.
 
 ## Skills
 

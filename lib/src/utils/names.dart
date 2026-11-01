@@ -46,6 +46,7 @@ enum ToolNames {
   createProject('create_project'),
   dartFix('dart_fix'),
   dartFormat('dart_format'),
+  dartpubSearch('dartpub_search'),
   dnAnalyze('dn_analyze'),
   dnAppLogs('dn_app_logs'),
   dnBuild('dn_build'),
